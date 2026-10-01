@@ -179,7 +179,13 @@ func environment(root string, libs []string) []string {
 	put("PATH", filepath.Join(root, "wrap")+":"+os.Getenv("PATH"))
 	set("SSL_CERT_FILE", filepath.Join(root, "etc/ssl/certs/ca-certificates.crt"))
 	set("SSL_CERT_DIR", filepath.Join(root, "etc/ssl/certs"))
-	set("LD_LIBRARY_PATH", strings.Join(libs, ":"))
+	// Deliberately NOT LD_LIBRARY_PATH. The binary, ffmpeg and ffprobe are all run through the
+	// bundle's loader with an explicit --library-path, which also covers dlopen, so it would be
+	// redundant — and it is actively harmful: it is inherited by every subprocess, including the
+	// runtime image's own /bin/sh, which then tries to load the bundle's glibc 2.41 against
+	// Debian 12's loader and dies with
+	//   /bin/sh: symbol lookup error: .../libc.so.6: undefined symbol: __tunable_is_initialized
+	// before it can run a line of the ffmpeg wrapper. That is what made a video attachment 500.
 	return env
 }
 
