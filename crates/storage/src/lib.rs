@@ -1,5 +1,6 @@
-//! Active Storage-compatible storage for Campfire: blobs and their rows, the disk service and its
-//! signed URLs, Marcel content type identification, analyzers, tracked variants processed with
+//! Active Storage-compatible storage for Campfire: blobs and their rows, the services the bytes
+//! live in (local disk or an S3-compatible bucket) behind [`Service`], the signed URLs they are
+//! served through, Marcel content type identification, analyzers, tracked variants processed with
 //! libvips (as image_processing does) and video previews via ffmpeg (as VideoPreviewer does).
 //!
 //! Golden vectors come from `reference-tools/storage/generate.rb` (`vectors/storage.json` and
@@ -18,6 +19,8 @@ pub mod marcel;
 pub mod marshal;
 pub mod paths;
 pub mod process;
+pub mod s3;
+pub mod service;
 pub mod storage;
 #[rustfmt::skip]
 mod tables;
@@ -28,6 +31,8 @@ pub use blob::{Blob, NewBlob};
 pub use disk::DiskService;
 pub use filename::Filename;
 pub use json::Json;
+pub use s3::S3Service;
+pub use service::{Service, Source, Stat};
 pub use storage::{Staged, Storage};
 pub use variation::Variation;
 
@@ -53,6 +58,11 @@ pub enum Error {
     Preview(String),
     #[error("analysis failed: {0}")]
     Analyze(String),
+    /// A storage service failed in a way that is neither "no such object" nor a bad checksum: a
+    /// misconfiguration, a refused credential, or the bucket being unreachable. Never carries a
+    /// signed URL, which would carry the credential with it.
+    #[error("{0}")]
+    Service(String),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]

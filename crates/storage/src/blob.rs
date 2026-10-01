@@ -223,8 +223,8 @@ impl Blob {
         }
     }
 
-    /// `delete`: the file, plus any legacy untracked variants under `variants/<key>/`.
-    pub fn delete_files(&self, service: &crate::DiskService) -> Result<()> {
+    /// `delete`: the object, plus any legacy untracked variants under `variants/<key>/`.
+    pub fn delete_files(&self, service: &crate::Service) -> Result<()> {
         service.delete(&self.key)?;
         if self.is_image() {
             service.delete_prefixed(&format!("variants/{}/", self.key))?;

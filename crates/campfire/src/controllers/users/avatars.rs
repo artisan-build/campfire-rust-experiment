@@ -38,8 +38,7 @@ pub async fn show(c: &mut Ctx) -> Result {
     c.expires_in(MAX_AGE, ExpiresIn { public: true, stale_while_revalidate: Some(STALE_WHILE_REVALIDATE), ..ExpiresIn::default() });
 
     if let Some(variant) = avatar_variant(c, &user).await? {
-        let path = c.app().storage.service.path_for(&variant.key);
-        c.send_file(path, SendOptions::inline("image/webp"))
+        crate::active_storage::send_variant(c, &variant, "image/webp")
     } else if user.is_bot() {
         render_default_bot(c)
     } else {

@@ -1,4 +1,4 @@
-//! The Active Storage flows Campfire drives, over one disk service and the app verifier:
+//! The Active Storage flows Campfire drives, over one [`Service`] and the app verifier:
 //! uploads (`create_and_upload!`), analysis, tracked variants (`VariantWithRecord`) and video
 //! previews (`ActiveStorage::Preview`).
 //!
@@ -16,17 +16,17 @@ use tempfile::NamedTempFile;
 
 use crate::analyze::Analyzer;
 use crate::blob::{self, Blob, NewBlob};
-use crate::disk::DiskService;
 use crate::filename::Filename;
 use crate::json::Json;
 use crate::key::checksum_file;
 use crate::marshal::Value;
 use crate::process;
+use crate::service::{Service, Source};
 use crate::variation::Variation;
 use crate::{Error, Result};
 
 pub struct Storage {
-    pub service: DiskService,
+    pub service: Service,
     /// `ActiveStorage.verifier`: `rails_compat::app_verifier(secrets, "ActiveStorage")`. It signs
     /// blob ids (purpose "blob_id": `ActiveStorage::Blob` overrides both the signed-id verifier
     /// and `combine_signed_id_purposes`, so this is *not* the Active Record signed-id scheme),
@@ -36,13 +36,13 @@ pub struct Storage {
     pub verifier: MessageVerifier,
 }
 
-/// A new blob whose file is already in the service but whose row isn't saved yet. Dropping it
-/// deletes the file, so a write that rolls back (or never saves the row) leaves no orphan behind;
-/// [`Staged::keep`] it once the row is committed.
+/// A new blob whose bytes are already in the service but whose row isn't saved yet. Dropping it
+/// deletes the object, so a write that rolls back (or never saves the row) leaves no orphan
+/// behind; [`Staged::keep`] it once the row is committed.
 #[derive(Debug)]
 pub struct Staged {
     blob: NewBlob,
-    service: DiskService,
+    service: Service,
     kept: bool,
 }
 
@@ -71,7 +71,7 @@ impl Drop for Staged {
 }
 
 impl Storage {
-    pub fn new(service: DiskService, verifier: MessageVerifier) -> Self {
+    pub fn new(service: Service, verifier: MessageVerifier) -> Self {
         Self { service, verifier }
     }
 
@@ -81,23 +81,23 @@ impl Storage {
     /// uploaded file does (`identify: true`): unfurls the file at `source` and uploads it.
     pub fn stage_file(&self, source: &Path, filename: Filename, declared_type: Option<&str>) -> Result<Staged> {
         let blob = NewBlob::unfurl_file(source, filename, declared_type, self.service.name(), true)?;
-        self.stage(blob, std::fs::File::open(source)?)
+        self.stage(blob, Source::File(source))
     }
 
     /// [`Self::stage_file`] for bytes in memory.
     pub fn stage_bytes(&self, data: &[u8], filename: Filename, declared_type: Option<&str>) -> Result<Staged> {
         let blob = NewBlob::unfurl(data, filename, declared_type, self.service.name(), true);
-        self.stage(blob, data)
+        self.stage(blob, Source::Bytes(data))
     }
 
-    /// Copies the blob's bytes into the service. Unlike `DiskService#upload`, the copy isn't read
-    /// back to verify its checksum: the checksum was just computed from these same local bytes, so
-    /// reading the copy back would only compare them with themselves, and [`Self::open`] still
-    /// verifies the file before it's analyzed or made into a variant or poster. The `Staged` comes
-    /// first, so a failed copy deletes what it wrote.
-    fn stage(&self, blob: NewBlob, reader: impl std::io::Read) -> Result<Staged> {
+    /// Copies the blob's bytes into the service. Unlike `Service::upload` with a checksum, the
+    /// copy isn't verified: the checksum was just computed from these same local bytes, so
+    /// checking it would only compare them with themselves, and [`Self::open`] still verifies the
+    /// bytes before they're analyzed or made into a variant or poster. The `Staged` comes first,
+    /// so a failed copy deletes what it wrote.
+    fn stage(&self, blob: NewBlob, source: Source<'_>) -> Result<Staged> {
         let staged = Staged { blob, service: self.service.clone(), kept: false };
-        self.service.upload(&staged.blob.key, reader, None)?;
+        self.service.upload(&staged.blob.key, source, None)?;
         Ok(staged)
     }
 
@@ -107,8 +107,7 @@ impl Storage {
             .prefix(&format!("ActiveStorage-{}-", blob.id))
             .suffix(blob.filename.extension_with_delimiter())
             .tempfile()?;
-        std::fs::copy(self.service.path_for(&blob.key), file.path())
-            .map_err(|e| if e.kind() == std::io::ErrorKind::NotFound { Error::FileNotFound } else { e.into() })?;
+        self.service.download_to(&blob.key, file.path())?;
         if let Some(checksum) = &blob.checksum
             && &checksum_file(file.path())? != checksum
         {
@@ -298,11 +297,12 @@ impl Storage {
         }
     }
 
-    pub fn path_for(&self, blob: &Blob) -> std::path::PathBuf {
-        self.service.path_for(&blob.key)
+    /// The file on disk holding the blob, when the service has one (see [`Service::local_path`]).
+    pub fn local_path(&self, blob: &Blob) -> Option<std::path::PathBuf> {
+        self.service.local_path(&blob.key)
     }
 
-    /// Deletes the blob's files (`Blob#delete`); rows are the caller's.
+    /// Deletes the blob's objects (`Blob#delete`); rows are the caller's.
     pub fn delete_files(&self, blob: &Blob) -> Result<()> {
         blob.delete_files(&self.service)
     }
@@ -318,28 +318,22 @@ fn analyzed(metadata: &Json, mut extracted: Json) -> Json {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Read;
-
     use super::*;
 
-    struct Broken;
-
-    impl Read for Broken {
-        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
-            Err(std::io::Error::other("the disk went away"))
-        }
-    }
-
     #[test]
-    fn a_copy_that_fails_leaves_no_file_behind() {
+    fn a_copy_that_fails_leaves_nothing_behind() {
         let root = tempfile::tempdir().unwrap();
         let verifier = rails_compat::app_verifier(&rails_compat::Secrets::new("test"), "ActiveStorage");
-        let storage = Storage::new(DiskService::new(root.path(), "local"), verifier);
-        let blob = NewBlob::unfurl(b"partial and more", Filename::new("a.txt"), None, "local", true);
+        let storage = Storage::new(Service::disk(root.path(), "local"), verifier);
+        let blob = NewBlob::unfurl(b"bytes", Filename::new("a.txt"), None, "local", true);
         let key = blob.key.clone();
 
-        let Err(Error::Io(error)) = storage.stage(blob, b"partial".chain(Broken)) else { panic!("a broken copy was staged") };
-        assert_eq!(error.to_string(), "the disk went away");
+        // A source that cannot be read: the upload fails after `Staged` exists, so its `Drop`
+        // is what has to clean up.
+        let Err(Error::Io(error)) = storage.stage(blob, Source::File(&root.path().join("gone"))) else {
+            panic!("a broken copy was staged")
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
         assert!(!storage.service.exist(&key));
     }
 }

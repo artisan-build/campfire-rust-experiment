@@ -3,7 +3,7 @@
 //! (`PUT /rails/active_storage/disk/:encoded_token`).
 
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 
 use rails_compat::MessageVerifier;
@@ -12,6 +12,7 @@ use crate::disposition::{content_disposition_with, escape_path, escape_segment};
 use crate::filename::Filename;
 use crate::json::Json;
 use crate::key::checksum_file;
+use crate::service::{Source, Stat};
 use crate::{Error, Result};
 
 #[derive(Clone, Debug)]
@@ -58,12 +59,18 @@ impl DiskService {
     }
 
     /// `upload(key, io, checksum:)`: write, then verify the MD5 and delete on mismatch.
-    pub fn upload(&self, key: &str, mut reader: impl Read, checksum: Option<&str>) -> Result<()> {
+    pub fn upload(&self, key: &str, source: Source<'_>, checksum: Option<&str>) -> Result<()> {
         let path = self.make_path_for(key)?;
-        let mut file = fs::File::create(&path)?;
-        io::copy(&mut reader, &mut file)?;
-        file.flush()?;
-        drop(file);
+        match source {
+            Source::Bytes(bytes) => {
+                let mut file = fs::File::create(&path)?;
+                file.write_all(bytes)?;
+                file.flush()?;
+            }
+            Source::File(from) => {
+                fs::copy(from, &path)?;
+            }
+        }
         if let Some(checksum) = checksum {
             self.ensure_integrity_of(key, checksum)?;
         }
@@ -72,6 +79,35 @@ impl DiskService {
 
     pub fn download(&self, key: &str) -> Result<Vec<u8>> {
         fs::read(self.path_for(key)).map_err(not_found)
+    }
+
+    /// The whole file copied over `dest`, which already exists.
+    pub fn download_to(&self, key: &str, dest: &Path) -> Result<()> {
+        fs::copy(self.path_for(key), dest).map_err(not_found)?;
+        Ok(())
+    }
+
+    /// `File#size` and `File#mtime`, which is what `Rack::Files` serves conditional GETs from.
+    pub fn stat(&self, key: &str) -> Result<Stat> {
+        let metadata = fs::metadata(self.path_for(key)).map_err(not_found)?;
+        let modified = jiff::Timestamp::try_from(metadata.modified()?).unwrap_or(jiff::Timestamp::UNIX_EPOCH);
+        Ok(Stat { size: metadata.len(), modified })
+    }
+
+    /// `download_chunk(key, range)`, as a reader so a byte-range response streams from disk.
+    pub fn open_range(&self, key: &str, start: u64, len: u64) -> Result<Box<dyn Read + Send>> {
+        let mut file = fs::File::open(self.path_for(key)).map_err(not_found)?;
+        file.seek(io::SeekFrom::Start(start))?;
+        Ok(Box::new(file.take(len)))
+    }
+
+    /// The keys and sizes of the files under `prefix`, for diagnostics. Keys are two levels deep
+    /// (`folder_for`), so this walks the tree rather than one directory.
+    pub fn list(&self, prefix: &str) -> Result<Vec<(String, u64)>> {
+        let mut found = Vec::new();
+        walk(&self.root, prefix, &mut found)?;
+        found.sort();
+        Ok(found)
     }
 
     pub fn delete(&self, key: &str) -> Result<()> {
@@ -100,49 +136,6 @@ impl DiskService {
         self.path_for(key).exists()
     }
 
-    /// The path of `service.url(key, expires_in:, filename:, content_type:, disposition:)`
-    /// (the caller prefixes `ActiveStorage::Current.url_options`' protocol and host).
-    pub fn url_path(
-        &self,
-        verifier: &MessageVerifier,
-        key: &str,
-        expires_at: Option<jiff::Timestamp>,
-        filename: &Filename,
-        content_type: Option<&str>,
-        disposition: &str,
-    ) -> String {
-        let sanitized = filename.sanitized();
-        let payload = Json::Object(vec![
-            ("key".into(), key.into()),
-            ("disposition".into(), content_disposition_with(disposition, &sanitized).into()),
-            ("content_type".into(), content_type.map_or(Json::Null, Json::from)),
-            ("service_name".into(), self.name.as_str().into()),
-        ]);
-        let encoded_key = verifier.generate_raw(&payload.encode(), Some("blob_key"), expires_at);
-        format!("/rails/active_storage/disk/{}/{}", escape_segment(&encoded_key), escape_path(&sanitized))
-    }
-
-    /// The path of `url_for_direct_upload`.
-    pub fn url_path_for_direct_upload(
-        &self,
-        verifier: &MessageVerifier,
-        key: &str,
-        expires_at: jiff::Timestamp,
-        content_type: Option<&str>,
-        content_length: i64,
-        checksum: &str,
-    ) -> String {
-        let payload = Json::Object(vec![
-            ("key".into(), key.into()),
-            ("content_type".into(), content_type.map_or(Json::Null, Json::from)),
-            ("content_length".into(), content_length.into()),
-            ("checksum".into(), checksum.into()),
-            ("service_name".into(), self.name.as_str().into()),
-        ]);
-        let token = verifier.generate_raw(&payload.encode(), Some("blob_token"), Some(expires_at));
-        format!("/rails/active_storage/disk/{}", escape_segment(&token))
-    }
-
     fn make_path_for(&self, key: &str) -> Result<PathBuf> {
         let path = self.path_for(key);
         if let Some(parent) = path.parent() {
@@ -158,6 +151,52 @@ impl DiskService {
         }
         Ok(())
     }
+}
+
+/// The path of `service.url(key, expires_in:, filename:, content_type:, disposition:)` (the caller
+/// prefixes `ActiveStorage::Current.url_options`' protocol and host).
+///
+/// A free function taking the service name, not a `DiskService` method, because every service
+/// serves its blobs through this one signed app route — see `service.rs`.
+pub fn url_path(
+    verifier: &MessageVerifier,
+    service_name: &str,
+    key: &str,
+    expires_at: Option<jiff::Timestamp>,
+    filename: &Filename,
+    content_type: Option<&str>,
+    disposition: &str,
+) -> String {
+    let sanitized = filename.sanitized();
+    let payload = Json::Object(vec![
+        ("key".into(), key.into()),
+        ("disposition".into(), content_disposition_with(disposition, &sanitized).into()),
+        ("content_type".into(), content_type.map_or(Json::Null, Json::from)),
+        ("service_name".into(), service_name.into()),
+    ]);
+    let encoded_key = verifier.generate_raw(&payload.encode(), Some("blob_key"), expires_at);
+    format!("/rails/active_storage/disk/{}/{}", escape_segment(&encoded_key), escape_path(&sanitized))
+}
+
+/// The path of `url_for_direct_upload`.
+pub fn url_path_for_direct_upload(
+    verifier: &MessageVerifier,
+    service_name: &str,
+    key: &str,
+    expires_at: jiff::Timestamp,
+    content_type: Option<&str>,
+    content_length: i64,
+    checksum: &str,
+) -> String {
+    let payload = Json::Object(vec![
+        ("key".into(), key.into()),
+        ("content_type".into(), content_type.map_or(Json::Null, Json::from)),
+        ("content_length".into(), content_length.into()),
+        ("checksum".into(), checksum.into()),
+        ("service_name".into(), service_name.into()),
+    ]);
+    let token = verifier.generate_raw(&payload.encode(), Some("blob_token"), Some(expires_at));
+    format!("/rails/active_storage/disk/{}", escape_segment(&token))
 }
 
 /// `DiskController#decode_verified_key`.
@@ -190,6 +229,23 @@ fn folder_for(key: &str) -> String {
     format!("{a}/{b}")
 }
 
+/// Every file under `dir` whose name starts with `prefix`. Names, not paths: a key's file is
+/// named after the whole key, and its two directories are derived from it (`folder_for`).
+fn walk(dir: &Path, prefix: &str, found: &mut Vec<(String, u64)>) -> Result<()> {
+    let Ok(entries) = fs::read_dir(dir) else { return Ok(()) };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            walk(&path, prefix, found)?;
+        } else if let Some(name) = path.file_name().and_then(|n| n.to_str())
+            && name.starts_with(prefix)
+        {
+            found.push((name.to_string(), entry.metadata()?.len()));
+        }
+    }
+    Ok(())
+}
+
 fn not_found(e: io::Error) -> Error {
     if e.kind() == io::ErrorKind::NotFound { Error::FileNotFound } else { e.into() }
 }
@@ -203,14 +259,37 @@ mod tests {
     fn an_upload_with_a_checksum_is_verified() {
         let root = tempfile::tempdir().unwrap();
         let service = DiskService::new(root.path(), "local");
-        service.upload("matching", &b"bytes"[..], Some(&checksum(b"bytes"))).unwrap();
+        service.upload("matching", Source::Bytes(b"bytes"), Some(&checksum(b"bytes"))).unwrap();
         assert_eq!(service.download("matching").unwrap(), b"bytes");
 
-        let mismatched = service.upload("mismatched", &b"bytes"[..], Some(&checksum(b"other bytes")));
+        let mismatched = service.upload("mismatched", Source::Bytes(b"bytes"), Some(&checksum(b"other bytes")));
         assert!(matches!(mismatched, Err(Error::Integrity)), "{mismatched:?}");
         assert!(!service.exist("mismatched"));
 
-        service.upload("unchecked", &b"bytes"[..], None).unwrap();
+        service.upload("unchecked", Source::Bytes(b"bytes"), None).unwrap();
         assert_eq!(service.download("unchecked").unwrap(), b"bytes");
+    }
+
+    #[test]
+    fn a_range_reads_only_its_own_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let service = DiskService::new(root.path(), "local");
+        service.upload("ranged", Source::Bytes(b"0123456789"), None).unwrap();
+        let mut read = Vec::new();
+        service.open_range("ranged", 3, 4).unwrap().read_to_end(&mut read).unwrap();
+        assert_eq!(read, b"3456");
+        assert_eq!(service.stat("ranged").unwrap().size, 10);
+        assert!(matches!(service.stat("absent"), Err(Error::FileNotFound)));
+    }
+
+    #[test]
+    fn listing_finds_the_keys_under_a_prefix() {
+        let root = tempfile::tempdir().unwrap();
+        let service = DiskService::new(root.path(), "local");
+        service.upload("aa11key", Source::Bytes(b"x"), None).unwrap();
+        service.upload("aa11other", Source::Bytes(b"yy"), None).unwrap();
+        service.upload("zz99key", Source::Bytes(b"zzz"), None).unwrap();
+        assert_eq!(service.list("aa11").unwrap(), vec![("aa11key".into(), 1), ("aa11other".into(), 2)]);
+        assert_eq!(service.list("").unwrap().len(), 3);
     }
 }
