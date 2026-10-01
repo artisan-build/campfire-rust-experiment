@@ -13,7 +13,8 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
-repo=$(gh repo view --json nameWithOwner --jq .nameWithOwner)
+# `gh repo view` would resolve to the `upstream` remote, which is 37signals'.
+repo=$(gh repo view "$(git remote get-url origin)" --json nameWithOwner --jq .nameWithOwner)
 revision=$(git rev-parse --short HEAD)
 tag="cloud-bundle-${revision}"
 work=$(mktemp -d)
@@ -48,7 +49,11 @@ done
 
 asset="$work/campfire-bundle-linux-arm64.tar.gz"
 tar -czf "$asset" -C "$out" .
-gh release create "$tag" "$asset" --repo "$repo" --title "$tag" \
-  --notes "Runtime bundle for Laravel Cloud, built from ${revision} for linux/arm64."
+if gh release view "$tag" --repo "$repo" >/dev/null 2>&1; then
+  gh release upload "$tag" "$asset" --repo "$repo" --clobber
+else
+  gh release create "$tag" "$asset" --repo "$repo" --title "$tag" \
+    --notes "Runtime bundle for Laravel Cloud, built from ${revision} for linux/arm64."
+fi
 echo "$tag" > .cloud/bundle-release
 echo "published $tag ($(du -h "$asset" | cut -f1))"
