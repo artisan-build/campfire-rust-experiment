@@ -25,6 +25,7 @@ mod config;
 mod conn;
 mod handler;
 mod tls;
+mod upgrade_recovery;
 
 use std::future::Future;
 use std::sync::Arc;
@@ -62,6 +63,7 @@ pub async fn serve_with(
         read_timeout: nonzero(config.http_read_timeout),
         write_timeout: nonzero(config.http_write_timeout),
         date: true,
+        recover_upgrade_headers: config.recover_upgrade_headers,
     };
     let handler = Arc::new(Handler::new(&config, app.clone()));
     let front: Service = Arc::new(move |request, conn| {

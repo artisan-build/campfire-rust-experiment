@@ -34,6 +34,7 @@ use tokio::sync::{Notify, watch};
 use tokio::time::{Instant, Sleep};
 
 use super::handler::ConnInfo;
+use super::upgrade_recovery::RecoverUpgrade;
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -47,6 +48,8 @@ pub struct Options {
     pub write_timeout: Option<Duration>,
     /// Send a `Date` header (Go does; Puma doesn't).
     pub date: bool,
+    /// Put back an `Upgrade`/`Connection` pair a reverse proxy dropped (`upgrade_recovery`).
+    pub recover_upgrade_headers: bool,
 }
 
 /// Which protocols a connection may speak.
@@ -212,7 +215,9 @@ where
             let _ = connection.await;
         }};
     }
-    let io = TokioIo::new(io);
+    // Before hyper parses anything: an edge that drops the handshake's `Upgrade` header leaves
+    // hyper no way to upgrade the connection at all.
+    let io = TokioIo::new(MaybeRecovered::new(io, options.recover_upgrade_headers));
     // hyper's HTTP/1 header read timeout doubles as its idle timer (see the module doc).
     match protocol {
         Protocol::Http1 => {
@@ -376,5 +381,50 @@ where
 
     fn size_hint(&self) -> SizeHint {
         self.inner.size_hint()
+    }
+}
+
+/// A connection's IO, with `RecoverUpgrade` in front of it or not. (`serve_connection` is generic
+/// over its IO, so the two cannot be different types.)
+enum MaybeRecovered<I> {
+    Plain(I),
+    Recovered(RecoverUpgrade<I>),
+}
+
+impl<I> MaybeRecovered<I> {
+    fn new(io: I, recover: bool) -> Self {
+        if recover { Self::Recovered(RecoverUpgrade::new(io)) } else { Self::Plain(io) }
+    }
+}
+
+impl<I: AsyncRead + AsyncWrite + Unpin> AsyncRead for MaybeRecovered<I> {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut tokio::io::ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            MaybeRecovered::Plain(io) => Pin::new(io).poll_read(cx, buf),
+            MaybeRecovered::Recovered(io) => Pin::new(io).poll_read(cx, buf),
+        }
+    }
+}
+
+impl<I: AsyncRead + AsyncWrite + Unpin> AsyncWrite for MaybeRecovered<I> {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            MaybeRecovered::Plain(io) => Pin::new(io).poll_write(cx, buf),
+            MaybeRecovered::Recovered(io) => Pin::new(io).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            MaybeRecovered::Plain(io) => Pin::new(io).poll_flush(cx),
+            MaybeRecovered::Recovered(io) => Pin::new(io).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            MaybeRecovered::Plain(io) => Pin::new(io).poll_shutdown(cx),
+            MaybeRecovered::Recovered(io) => Pin::new(io).poll_shutdown(cx),
+        }
     }
 }

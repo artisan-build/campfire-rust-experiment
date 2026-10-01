@@ -49,6 +49,9 @@ pub struct FrontConfig {
     pub debug: bool,
     /// `LOG_REQUESTS`
     pub log_requests: bool,
+    /// `RECOVER_UPGRADE_HEADERS` (not Thruster's): put back the `Upgrade` and `Connection` headers
+    /// a reverse proxy dropped from a WebSocket handshake. See `front::upgrade_recovery`.
+    pub recover_upgrade_headers: bool,
 }
 
 impl FrontConfig {
@@ -97,6 +100,7 @@ impl FrontConfig {
             forward_headers: false,
             debug: boolean("DEBUG", false),
             log_requests: boolean("LOG_REQUESTS", true),
+            recover_upgrade_headers: boolean("RECOVER_UPGRADE_HEADERS", false),
         };
         config.forward_headers = boolean("FORWARD_HEADERS", !config.has_tls());
         config
