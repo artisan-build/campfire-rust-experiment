@@ -12,7 +12,8 @@
 #     neither is in Cloud's runtime image (crates/storage shells out to both);
 #   * serve on the port the per-instance nginx proxies to (it proxies 127.0.0.1:$PORT);
 #   * keep the SQLite database on the attached bucket with Litestream, because Cloud's filesystem is
-#     wiped by every deploy, reboot and scale-to-zero wake.
+#     wiped by every deploy and reboot. (A scale-to-zero wake does NOT wipe it: that is a container
+#     thaw, same process, same disk — measured, see brain's reports/hibernation.md.)
 #
 # Everything here is overridable: a value already in the environment always wins, so any of it can
 # be changed from the Cloud dashboard without a new deploy of this script.

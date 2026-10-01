@@ -247,9 +247,13 @@ Honest ones, all measured on this deployment rather than assumed:
 - **The WebSocket header workaround is required** (`RECOVER_UPGRADE_HEADERS=1`, above). While you
   are there: Cloud's nginx uses `proxy_read_timeout 20`, so a WebSocket survives only because
   Action Cable pings every 3 seconds. Verified by holding a connection idle for 90 seconds.
-- **Hibernation does not appear to fire.** The environment reports `uses_hibernation: true` with a
-  5-minute timeout, and the same process answered after 8 and then 25 minutes of silence. So budget
-  for the instance running continuously, and don't rely on scale-to-zero.
+- **Hibernation works, and a single connected browser switches it off.** Scale-to-zero fires five
+  minutes after the last inbound request, and Cloud counts an open WebSocket as an inbound request
+  for as long as it is open — so an environment nobody is looking at sleeps (and is not billed),
+  while one idle tab with a cable connection keeps the instance awake continuously. The wake is a
+  container thaw, not a restart: on current Flex sizes it costs about half a second, the same process
+  answers, no new boot line is logged, and the filesystem is NOT wiped (only a deploy wipes it).
+  Measured both ways in `~/Herd/brain/projects/campfire-rust-experiment/reports/hibernation.md`.
 - **Deploys take ~4.5 minutes** because Cloud keeps no cargo registry or target-directory cache
   between Rust builds. An unchanged commit recompiles from scratch.
 - **Thumbnails and video posters are not byte-identical to the upstream image's.** This branch's
