@@ -86,3 +86,5 @@ step "launcher"
 install -D -m 755 .cloud/boot /var/www/bin/boot
 ls -la /var/www/bin
 du -sh libexec/campfire runtime
+# What the deploy artifact actually costs: the whole app path, vendored dependencies included.
+du -sh /var/www/html
