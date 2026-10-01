@@ -119,13 +119,13 @@ func litestream(root string, env []string, argv []string) ([]string, error) {
 		return nil, err
 	}
 
-	restore := exec.Command(binary, "-config", config, "restore", "-if-db-not-exists", "-if-replica-exists", database)
+	restore := exec.Command(binary, "restore", "-config", config, "-if-db-not-exists", "-if-replica-exists", database)
 	restore.Env, restore.Stdout, restore.Stderr = env, os.Stderr, os.Stderr
 	if err := restore.Run(); err != nil {
 		// A failed restore must not silently start an empty database over a live replica.
 		return nil, fmt.Errorf("litestream restore: %w", err)
 	}
-	return []string{binary, "-config", config, "replicate", "-exec", strings.Join(argv, " ")}, nil
+	return []string{binary, "replicate", "-config", config, "-exec", strings.Join(argv, " ")}, nil
 }
 
 // databasePath mirrors campfire's own storage layout (crates/campfire/src/config.rs).
