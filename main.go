@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -72,7 +73,75 @@ func launch(args []string) error {
 	// ffmpeg and ffprobe are run as subprocesses and need the same loader, so the build command
 	// leaves wrappers in bundle/wrap and they go first on PATH.
 	env := environment(root, libs)
+
+	// Cloud's filesystem is wiped by every deploy, reboot and scale-to-zero wake, and the only
+	// copy of a SQLite database is a file on it. Litestream keeps that file on the attached
+	// bucket: restore what is there, then run the server under continuous replication.
+	if replicated, err := litestream(root, env, argv); err != nil {
+		return err
+	} else if replicated != nil {
+		return syscall.Exec(replicated[0], replicated, env)
+	}
 	return syscall.Exec(loader, argv, env)
+}
+
+// litestream restores the database from the bucket and returns the argv that runs `argv` under
+// replication, or nil when no bucket is attached.
+func litestream(root string, env []string, argv []string) ([]string, error) {
+	binary := filepath.Join(root, "bin/litestream")
+	bucket := os.Getenv("AWS_BUCKET")
+	if bucket == "" {
+		fmt.Fprintln(os.Stderr, "launcher: no AWS_BUCKET; the database lives only on the ephemeral filesystem")
+		return nil, nil
+	}
+	if _, err := os.Stat(binary); err != nil {
+		return nil, nil
+	}
+
+	database := databasePath()
+	if err := os.MkdirAll(filepath.Dir(database), 0o755); err != nil {
+		return nil, err
+	}
+	config := filepath.Join(os.TempDir(), "litestream.yml")
+	// No credentials here: Litestream reads AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY from the
+	// environment Cloud injected, so nothing secret is written to disk.
+	body := fmt.Sprintf(`dbs:
+  - path: %s
+    replicas:
+      - type: s3
+        bucket: %s
+        path: campfire
+        endpoint: %s
+        region: %s
+        force-path-style: true
+`, database, bucket, os.Getenv("AWS_ENDPOINT_URL"), os.Getenv("AWS_REGION"))
+	if err := os.WriteFile(config, []byte(body), 0o600); err != nil {
+		return nil, err
+	}
+
+	restore := exec.Command(binary, "-config", config, "restore", "-if-db-not-exists", "-if-replica-exists", database)
+	restore.Env, restore.Stdout, restore.Stderr = env, os.Stderr, os.Stderr
+	if err := restore.Run(); err != nil {
+		// A failed restore must not silently start an empty database over a live replica.
+		return nil, fmt.Errorf("litestream restore: %w", err)
+	}
+	return []string{binary, "-config", config, "replicate", "-exec", strings.Join(argv, " ")}, nil
+}
+
+// databasePath mirrors campfire's own storage layout (crates/campfire/src/config.rs).
+func databasePath() string {
+	if path := os.Getenv("CAMPFIRE_DATABASE_PATH"); path != "" {
+		return path
+	}
+	root := os.Getenv("CAMPFIRE_STORAGE_PATH")
+	if root == "" {
+		root = "storage"
+	}
+	environment := os.Getenv("RAILS_ENV")
+	if environment == "" {
+		environment = "production"
+	}
+	return filepath.Join(root, "db", environment+".sqlite3")
 }
 
 // environment is the campfire process's environment: Cloud's injected variables, plus what the
