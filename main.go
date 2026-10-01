@@ -31,6 +31,9 @@ var loaders = map[string][2]string{
 const bundle = "bundle"
 
 func main() {
+	// The keys only: which variables Cloud injected is worth seeing in the logs, their values
+	// never are.
+	fmt.Fprintf(os.Stderr, "launcher: injected variables: %s\n", strings.Join(environmentKeys(), " "))
 	if _, err := os.Stat(filepath.Join(bundle, "usr/local/bin/campfire")); err == nil {
 		if err := launch(os.Args[1:]); err != nil {
 			fmt.Fprintf(os.Stderr, "launcher: %v\n", err)
@@ -130,13 +133,17 @@ func diagnostics() string {
 	for _, d := range []string{".", "/", "/lib", "/usr/lib", "/lib/x86_64-linux-gnu", "/lib/aarch64-linux-gnu", "/usr/bin", "/tmp"} {
 		fmt.Fprintf(&b, "--- ls %s\n%s\n", d, listing(d))
 	}
+	fmt.Fprintf(&b, "--- env keys\n%s\n", strings.Join(environmentKeys(), " "))
+	return b.String()
+}
+
+func environmentKeys() []string {
 	keys := make([]string, 0, len(os.Environ()))
 	for _, kv := range os.Environ() {
 		keys = append(keys, strings.SplitN(kv, "=", 2)[0])
 	}
 	sort.Strings(keys)
-	fmt.Fprintf(&b, "--- env keys\n%s\n", strings.Join(keys, " "))
-	return b.String()
+	return keys
 }
 
 func listing(dir string) string {
