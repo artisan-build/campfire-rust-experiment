@@ -24,7 +24,10 @@ cd "$app"
 default() { eval "v=\${$1-}"; [ -n "$v" ] || export "$1=$2"; }
 
 default LD_LIBRARY_PATH "$app/runtime/lib"
-default PATH "$app/runtime/bin:$PATH"
+# PATH always has a value, so this one is prepended rather than defaulted: it is how campfire's
+# video previews find ffmpeg and ffprobe (crates/storage/src/process.rs).
+PATH="$app/runtime/bin:$PATH"
+export PATH
 # Cloud terminates TLS at its proxy, so the binary serves plain HTTP and leaves its own TLS/ACME off
 # (no TLS_DOMAIN). DISABLE_SSL stays unset so that assume_ssl keeps forgery protection seeing https.
 default HTTP_PORT "${PORT:-3000}"
@@ -57,5 +60,5 @@ dbs:
 YAML
 
 # A failed restore must not silently start an empty database over a live replica.
-litestream restore -config "$config" -if-db-not-exists -if-replica-exists "$database"
-exec litestream replicate -config "$config" -exec "$app/libexec/campfire server"
+"$app/runtime/bin/litestream" restore -config "$config" -if-db-not-exists -if-replica-exists "$database"
+exec "$app/runtime/bin/litestream" replicate -config "$config" -exec "$app/libexec/campfire server"
