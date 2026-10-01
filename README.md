@@ -49,7 +49,29 @@ gh repo fork artisan-build/campfire-rust-experiment --clone
 Fork rather than point Cloud at this repository directly, so that nobody else's push changes what
 your server runs.
 
-Two things about the fork are worth knowing before you deploy:
+**Do this before any other `cloud` command:** the repository ships a `.cloud/config.json` holding
+the *maintainers'* Cloud organization and application ids, and your fork inherits it. Any `cloud`
+command you run without explicit ids resolves through that file, so it will talk about their
+application rather than yours. Replace it with your own organization id — which is also what gets
+you past `cloud application:create`'s "Multiple API tokens found" error when your account can see
+more than one organization:
+
+```sh
+printf '{\n  "organization_id": "%s"\n}\n' "<your org id>" > .cloud/config.json
+```
+
+(`cloud repo:config --organization=<id>` is the documented way to write that file, but it refuses
+to run until an application already exists — "Multiple applications found. Provide an application ID
+or name" — so for the very first application, write the file. `cloud repo:config <app>` fills in the
+application id afterwards.)
+
+Your organization id is what the API answers for your token:
+
+```sh
+curl -s https://cloud.laravel.com/api/meta/organization -H "Authorization: Bearer $CLOUD_API_TOKEN"
+```
+
+Two more things about the fork are worth knowing before you deploy:
 
 - **The `reference/` submodule is required to build.** `crates/assets` digests and embeds the
   upstream Rails app's CSS and JavaScript at compile time. `.cloud/build` checks the submodule out
@@ -70,11 +92,21 @@ cloud application:create \
   --name=campfire \
   --repository=<you>/campfire-rust-experiment \
   --source-provider=github \
-  --region=us-east-2
+  --region=us-east-2 \
+  --json --no-interaction
 ```
 
-Note the application id and the environment id it prints; everything else needs them. `cloud env:list <app>`
-prints them again later.
+(`--json --no-interaction` only skips the prompts; drop both to be asked instead. Every command
+below takes the same pair, or `--force`, for the same reason.)
+
+The application id is in that output. The environment id is **not** — ask for it:
+
+```sh
+cloud env:list <app> --json --fields=id,name,branch,buildCommand
+```
+
+You get one environment, called `production`, on your default branch. That is the one you configure;
+there is no need to create a second.
 
 Check that Cloud detected Rust, because nothing else will tell you:
 
@@ -105,10 +137,10 @@ on the loader's path, the bundled ffmpeg on `PATH`, and Litestream wrapped aroun
 ### 4. Set the environment variables
 
 ```sh
-cloud env:variables <env> --action=append --key=SECRET_KEY_BASE          --value="$(openssl rand -hex 64)"
-cloud env:variables <env> --action=append --key=RECOVER_UPGRADE_HEADERS  --value=1
-cloud env:variables <env> --action=append --key=CAMPFIRE_STORAGE_PATH    --value=/tmp/campfire-storage
-cloud env:variables <env> --action=append --key=RAILS_ENV                --value=production
+cloud env:variables <env> --action=append --force --key=SECRET_KEY_BASE          --value="$(openssl rand -hex 64)"
+cloud env:variables <env> --action=append --force --key=RECOVER_UPGRADE_HEADERS  --value=1
+cloud env:variables <env> --action=append --force --key=CAMPFIRE_STORAGE_PATH    --value=/tmp/campfire-storage
+cloud env:variables <env> --action=append --force --key=RAILS_ENV                --value=production
 ```
 
 | Variable | Why |
@@ -142,13 +174,22 @@ cloud bucket:create \
   --visibility=private \
   --key-name=campfire \
   --key-permission=read_write \
-  --allowed-origins=https://<your-environment>.laravel.cloud
+  --allowed-origins=https://<your-environment>.laravel.cloud \
+  --json --no-interaction
 ```
 
 `--allowed-origins` is required for a private bucket even though no browser ever talks to it.
 
+That one command creates the bucket **and** its access key, but the output says `"keyIds": []`
+regardless — don't believe it. Ask for the key's id, which the attach step needs:
+
+```sh
+cloud bucket-key:list <bucket id> --json
+```
+
 Then **attach** it to the environment. The CLI cannot do this; use the dashboard (the
-environment's *Storage* section) or the API:
+environment's *Storage* section) or the API, with a token you create under *API tokens* in the
+dashboard:
 
 ```sh
 curl -X PATCH https://cloud.laravel.com/api/environments/<env> \
@@ -172,10 +213,10 @@ If it says `disk service` instead, the bucket is not attached and nothing you up
 ### 6. Deploy
 
 ```sh
-cloud deploy <app> <env>
+cloud deploy <app> production --no-wait --json
 ```
 
-Expect **about four and a half minutes**: roughly 3m 45s of it is `cargo build --release` with fat
+Without `--no-wait` the command waits and reports progress itself. Expect **about four and a half minutes**: roughly 3m 45s of it is `cargo build --release` with fat
 LTO, from scratch, because Cloud caches nothing for Rust. The 15-minute build cap is not close.
 
 If it fails, read the build log before changing anything — it is complete, and it includes the
