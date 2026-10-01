@@ -72,6 +72,10 @@ started=$(date +%s)
 # crates/storage links libvips, libgobject-2.0 and libglib-2.0 by name
 # (crates/storage/src/vips.rs), which the linker resolves through the bundle's unversioned symlinks.
 export LIBRARY_PATH="$PWD/runtime/lib"
+# -L (which LIBRARY_PATH becomes) resolves -lvips, but ld does not use it to find the libraries
+# libvips itself needs, so without -rpath-link every libjpeg/libtiff/libspng/libheif symbol
+# libvips references is undefined. LD_LIBRARY_PATH in .cloud/boot covers the same ground at run time.
+export RUSTFLAGS="${RUSTFLAGS-} -C link-arg=-Wl,-rpath-link=$PWD/runtime/lib"
 # jemalloc bakes the page size in: 16 KB works on both 4 KB and 16 KB arm64 kernels.
 export JEMALLOC_SYS_WITH_LG_PAGE=14
 cargo build --release --locked -p campfire
