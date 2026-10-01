@@ -502,8 +502,8 @@ async fn jobs_run_ad_hoc_work_and_purge_unattached_blobs() {
         })
         .await
         .unwrap();
-    let path = app.storage.path_for(&blob);
-    assert!(path.exists());
+    let key = blob.key.clone();
+    assert!(app.storage.service.exist(&key));
 
     // Blob 5 is attached to a message: purging it is refused (`InvalidForeignKey`).
     app.jobs.emit(campfire_db::Event::PurgeBlob { blob_id: 5 });
@@ -511,12 +511,12 @@ async fn jobs_run_ad_hoc_work_and_purge_unattached_blobs() {
     let blob_id = blob.id;
     for _ in 0..50 {
         let gone = app.db.read(move |conn| Ok(campfire_storage::Blob::find(conn, blob_id).unwrap().is_none())).await.unwrap();
-        if gone && !path.exists() {
+        if gone && !app.storage.service.exist(&key) {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
-    assert!(!path.exists());
+    assert!(!app.storage.service.exist(&key));
     let attached = app.db.read(|conn| Ok(campfire_storage::Blob::find(conn, 5).unwrap().is_some())).await.unwrap();
     assert!(attached);
 
@@ -612,7 +612,7 @@ async fn writes_proceed_while_a_variant_is_transformed() {
 
     release.send(()).unwrap();
     let image = processing.await.unwrap().unwrap();
-    assert!(app.storage.path_for(&image).exists());
+    assert!(app.storage.service.exist(&image.key));
     let storage = app.storage.clone();
     let recorded = app.db.read(move |conn| Ok(storage.existing_variant(conn, &blob, &variation).unwrap())).await.unwrap();
     assert_eq!(recorded.map(|b| b.id), Some(image.id));
@@ -624,7 +624,7 @@ async fn blob_byte_ranges_are_served_from_the_file() {
     let router = &test.booted.router;
     let proxy_path = vectors().blobs[0].redirect_path.replacen("/redirect/", "/proxy/", 1);
     let blob = test.booted.app.db.read(|conn| Ok(campfire_storage::Blob::find(conn, 5).unwrap().unwrap())).await.unwrap();
-    let file = std::fs::read(test.booted.app.storage.path_for(&blob)).unwrap();
+    let file = test.booted.app.storage.service.download(&blob.key).unwrap();
     let ranged =
         |range: &str| Request::get(&proxy_path).header(header::HOST, "campfire.test").header("range", range).body(Body::empty()).unwrap();
 

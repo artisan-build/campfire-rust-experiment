@@ -17,7 +17,7 @@ use axum::middleware::Next;
 use campfire_db::{Connection, Database, Tx};
 use campfire_kit::exceptions::ErrorPages;
 use campfire_kit::{Ctx, Kit, KitConfig, SharedClock};
-use campfire_storage::{DiskService, Storage};
+use campfire_storage::Storage;
 use campfire_views::fragment_cache::{FragmentCache, Scoped};
 use rails_compat::Secrets;
 
@@ -118,8 +118,12 @@ pub async fn boot(config: Config) -> anyhow::Result<Booted> {
     // config/puma.rb: `Membership.disconnect_all` when the server boots.
     db.write(|tx| campfire_db::Membership::disconnect_all(tx).map(|_| ())).await?;
 
-    let storage =
-        Arc::new(Storage::new(DiskService::new(&config.storage.files, "local"), rails_compat::app_verifier(&secrets, "ActiveStorage")));
+    // Where the blobs' bytes live: the local disk, or an S3-compatible bucket when one is
+    // attached (`campfire_storage::service::from_env`). Credentials come only from the
+    // environment, so nothing about the bucket is in the config or in git.
+    let service = campfire_storage::service::from_env(&config.storage.files)?;
+    tracing::info!("storage: {}", service.describe());
+    let storage = Arc::new(Storage::new(service, rails_compat::app_verifier(&secrets, "ActiveStorage")));
 
     let cable_config = campfire_cable::Config { assume_ssl: !config.disable_ssl, ..campfire_cable::Config::default() };
     let deps = channels::Deps { db: db.clone(), secrets: secrets.clone(), clock: clock.clone() };
@@ -221,7 +225,7 @@ fn error_pages() -> ErrorPages {
 
 // --- Commands --------------------------------------------------------------------------------------
 
-const USAGE: &str = "usage: campfire [server|backup]";
+const USAGE: &str = "usage: campfire [server|backup|storage:list [prefix]]";
 
 /// The binary's entry point.
 ///
@@ -249,8 +253,25 @@ pub fn run() -> anyhow::Result<()> {
             tokio::runtime::Runtime::new()?.block_on(serve(config))
         }
         Some("backup") => backup(&config),
+        Some("storage:list") => storage_list(&config, std::env::args().nth(2).unwrap_or_default()),
         Some(other) => anyhow::bail!("unknown command {other:?}\n{USAGE}"),
     }
+}
+
+/// `campfire storage:list [prefix]`: the objects the configured storage service holds, so that
+/// "the blobs really are in the bucket" is answerable from the same process, with the same
+/// credentials, as the server. Prints the service (never its credentials) and then key and size,
+/// one object per line.
+fn storage_list(config: &Config, prefix: String) -> anyhow::Result<()> {
+    let service = campfire_storage::service::from_env(&config.storage.files)?;
+    println!("{}", service.describe());
+    let mut total = 0;
+    for (key, size) in service.list(&prefix)? {
+        println!("{size:>12}  {key}");
+        total += size;
+    }
+    println!("{total} bytes");
+    Ok(())
 }
 
 fn init_logging(config: &Config) {

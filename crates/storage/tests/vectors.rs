@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use campfire_storage::key::checksum_file;
 use campfire_storage::marshal::Value;
-use campfire_storage::{Blob, DiskService, Filename, Json, Storage, Variation, disk, disposition, marcel, paths};
+use campfire_storage::{Blob, Filename, Json, Service, Storage, Variation, disk, disposition, marcel, paths};
 use rails_compat::{MessageVerifier, Secrets};
 use rusqlite::Connection;
 use serde_json::Value as J;
@@ -101,11 +101,10 @@ fn verifier_messages_and_disk_urls() {
     assert!(verifier.verify_raw(v["expiring"].as_str().unwrap(), Some("p"), expires_at).is_err());
     assert!(verifier.verify_raw(v["expiring"].as_str().unwrap(), Some("q"), now()).is_err());
 
-    let service = DiskService::new("/tmp/unused", "local");
     let weird = Filename::new("weird & <name> ünï.png");
     let key = "abcdefghijklmnopqrstuvwxyz12";
-    assert_eq!(service.url_path(&verifier, key, None, &weird, Some("image/png"), "inline"), v["disk_url_path"]);
-    assert_eq!(service.url_path(&verifier, key, None, &weird, None, "attachment"), v["disk_url_path_nil_type"]);
+    assert_eq!(disk::url_path(&verifier, "local", key, None, &weird, Some("image/png"), "inline"), v["disk_url_path"]);
+    assert_eq!(disk::url_path(&verifier, "local", key, None, &weird, None, "attachment"), v["disk_url_path_nil_type"]);
 
     let encoded_key = v["disk_url_path"].as_str().unwrap().split('/').nth(4).unwrap();
     let decoded = disk::decode_verified_key(&verifier, encoded_key, now()).unwrap();
@@ -169,7 +168,6 @@ fn blob_from(row: &J) -> Blob {
 #[test]
 fn route_paths() {
     let verifier = verifier();
-    let service = DiskService::new("/tmp/unused", "local");
     for m in vectors()["messages"].as_array().unwrap() {
         let blob = blob_from(&m["blob"]);
         assert_eq!(paths::blob_redirect_path(&verifier, &blob, None), m["rails_blob_path"]);
@@ -187,8 +185,9 @@ fn route_paths() {
             let d = campfire_storage::content_types::forced_disposition(content_type).unwrap_or(disposition);
             format!(
                 "http://campfire.test{}",
-                service.url_path(
+                disk::url_path(
                     &verifier,
+                    "local",
                     &blob.key,
                     None,
                     &blob.filename,
@@ -218,14 +217,8 @@ fn route_paths() {
 
 // --- The upload → analyze → variant/preview pipeline -------------------------------------------
 
-const SCHEMA: &str = r#"
-CREATE TABLE active_storage_attachments (id integer PRIMARY KEY AUTOINCREMENT NOT NULL, blob_id bigint NOT NULL, created_at datetime(6) NOT NULL, name varchar NOT NULL, record_id bigint NOT NULL, record_type varchar NOT NULL);
-CREATE UNIQUE INDEX index_active_storage_attachments_uniqueness ON active_storage_attachments (record_type, record_id, name, blob_id);
-CREATE TABLE active_storage_blobs (id integer PRIMARY KEY AUTOINCREMENT NOT NULL, byte_size bigint NOT NULL, checksum varchar, content_type varchar, created_at datetime(6) NOT NULL, filename varchar NOT NULL, key varchar NOT NULL, metadata text, service_name varchar NOT NULL);
-CREATE UNIQUE INDEX index_active_storage_blobs_on_key ON active_storage_blobs (key);
-CREATE TABLE active_storage_variant_records (id integer PRIMARY KEY AUTOINCREMENT NOT NULL, blob_id bigint NOT NULL, variation_digest varchar NOT NULL);
-CREATE UNIQUE INDEX index_active_storage_variant_records_uniqueness ON active_storage_variant_records (blob_id, variation_digest);
-"#;
+/// Shared with `tests/s3.rs`, which runs the same pipeline against a bucket.
+const SCHEMA: &str = include_str!("schema.sql");
 
 struct Comparison {
     compare_images: bool,
@@ -283,7 +276,7 @@ fn pipeline_matches_the_reference() {
     let vectors = vectors();
     let files = vectors_path().parent().unwrap().join("storage");
     let root = tempfile::tempdir().unwrap();
-    let storage = Storage::new(DiskService::new(root.path(), "local"), verifier());
+    let storage = Storage::new(Service::disk(root.path(), "local"), verifier());
     let conn = Connection::open_in_memory().unwrap();
     conn.execute_batch(SCHEMA).unwrap();
     let mut comparison = Comparison::new(&vectors["versions"]);
@@ -292,11 +285,12 @@ fn pipeline_matches_the_reference() {
         let label = v["label"].as_str().unwrap();
         assert_eq!(variation(&v["transformations_typed"]).digest(), v["variation_digest"], "{label} digest");
         comparison.blob(label, &image, &v["blob"], true, video);
-        assert_eq!(storage.path_for(&image), root.path().join(image.key.get(0..2).unwrap()).join(&image.key[2..4]).join(&image.key));
+        let stored = storage.local_path(&image).expect("the disk service has a path");
+        assert_eq!(stored, root.path().join(image.key.get(0..2).unwrap()).join(&image.key[2..4]).join(&image.key));
         // The saved reference file is the variant blob's content, and ours is what we recorded.
         let expected = std::fs::read(files.join(v["file"].as_str().unwrap())).unwrap();
         assert_eq!(campfire_storage::key::checksum(&expected), v["blob"]["checksum"].as_str().unwrap(), "{label} vector file");
-        let actual = std::fs::read(storage.path_for(&image)).unwrap();
+        let actual = std::fs::read(&stored).unwrap();
         assert_eq!(campfire_storage::key::checksum(&actual), image.checksum.clone().unwrap(), "{label} stored file");
         let record_id = campfire_storage::blob::find_variant_record(conn, source.id, v["variation_digest"].as_str().unwrap()).unwrap();
         let attached = Blob::attached(conn, "ActiveStorage::VariantRecord", record_id.unwrap(), "image").unwrap();
@@ -360,7 +354,7 @@ fn pipeline_matches_the_reference() {
 #[test]
 fn staging_a_file_unfurls_it_as_its_bytes_would() {
     let root = tempfile::tempdir().unwrap();
-    let storage = Storage::new(DiskService::new(root.path(), "local"), verifier());
+    let storage = Storage::new(Service::disk(root.path(), "local"), verifier());
     for m in vectors()["messages"].as_array().unwrap() {
         let name = m["fixture"].as_str().unwrap();
         let declared = m["declared_type"].as_str();
@@ -368,10 +362,11 @@ fn staging_a_file_unfurls_it_as_its_bytes_would() {
         let from_bytes = storage.stage_bytes(&std::fs::read(fixture(name)).unwrap(), Filename::new(name), declared).unwrap();
         let (a, b) = (from_file.blob(), from_bytes.blob());
         assert_eq!((&a.content_type, &a.checksum, a.byte_size), (&b.content_type, &b.checksum, b.byte_size), "{name}");
-        assert_eq!(std::fs::read(storage.service.path_for(&a.key)).unwrap(), std::fs::read(fixture(name)).unwrap(), "{name}");
-        // Staging doesn't read the copies back, so check here what `DiskService#upload` would.
+        assert_eq!(storage.service.download(&a.key).unwrap(), std::fs::read(fixture(name)).unwrap(), "{name}");
+        // Staging doesn't read the copies back, so check here what an upload with a checksum would.
         for staged in [a, b] {
-            assert_eq!(checksum_file(&storage.service.path_for(&staged.key)).unwrap(), staged.checksum, "{name}");
+            let path = storage.service.local_path(&staged.key).expect("the disk service has a path");
+            assert_eq!(checksum_file(&path).unwrap(), staged.checksum, "{name}");
         }
     }
 }
@@ -379,15 +374,15 @@ fn staging_a_file_unfurls_it_as_its_bytes_would() {
 #[test]
 fn a_staged_file_is_deleted_unless_kept() {
     let root = tempfile::tempdir().unwrap();
-    let storage = Storage::new(DiskService::new(root.path(), "local"), verifier());
+    let storage = Storage::new(Service::disk(root.path(), "local"), verifier());
     let dropped = storage.stage_bytes(b"dropped", Filename::new("a.txt"), None).unwrap();
-    let dropped_path = storage.service.path_for(&dropped.blob().key);
-    assert!(dropped_path.exists());
+    let dropped_key = dropped.blob().key.clone();
+    assert!(storage.service.exist(&dropped_key));
     drop(dropped);
-    assert!(!dropped_path.exists());
+    assert!(!storage.service.exist(&dropped_key));
 
     let kept = storage.stage_bytes(b"kept", Filename::new("b.txt"), None).unwrap();
-    let kept_path = storage.service.path_for(&kept.blob().key);
+    let kept_key = kept.blob().key.clone();
     kept.keep();
-    assert!(kept_path.exists());
+    assert!(storage.service.exist(&kept_key));
 }

@@ -47,10 +47,7 @@ pub async fn show(c: &mut Ctx) -> Result {
         None => None,
     };
     match variant {
-        Some(variant) => {
-            let path = c.app().storage.service.path_for(&variant.key);
-            c.send_file(path, SendOptions::inline("image/png"))
-        }
+        Some(variant) => crate::active_storage::send_variant(c, &variant, "image/png"),
         // send_stock_icon
         None => {
             let filename = if small { "app-icon-192.png" } else { "app-icon.png" };

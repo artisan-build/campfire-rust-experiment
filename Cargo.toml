@@ -99,6 +99,17 @@ instant-acme = { version = "0.8", default-features = false, features = ["ring", 
 rcgen        = { version = "0.14", default-features = false, features = ["ring", "pem", "crypto"] }
 x509-parser  = "0.18"
 zstd         = "0.13"
+# crates/storage's S3 service (crates/storage/src/s3.rs). rusty-s3 only *signs* requests (SigV4,
+# path- or vhost-style) and hands back a URL plus headers, so the bytes go over a plain blocking
+# HTTP client and nothing adds a second checksum of its own: Cloudflare R2 rejects a PUT that
+# carries both `Content-MD5` and an `x-amz-checksum-*`. `rustcrypto` reuses the hmac/sha2 already
+# in the tree rather than pulling in aws-lc-rs.
+rusty-s3     = { version = "0.10", default-features = false, features = ["rustcrypto", "xml"] }
+# ureq, not the hyper client in crates/campfire/src/integrations: every storage call is blocking
+# (the file work runs on `spawn_blocking` so it never holds the database writer), and a blocking
+# client keeps crates/storage free of tokio. No `gzip`: blob bytes must arrive untouched.
+ureq         = { version = "3", default-features = false, features = ["rustls", "rustls-webpki-roots"] }
+
 # The global allocator (crates/campfire/src/main.rs)
 tikv-jemallocator = "0.6"
 tikv-jemalloc-sys = "0.6"

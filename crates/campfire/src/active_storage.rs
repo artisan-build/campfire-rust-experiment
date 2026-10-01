@@ -13,7 +13,7 @@ use std::sync::{Arc, LazyLock};
 use campfire_db::{CachedStatements, query_all};
 use campfire_kit::{Ctx, Error, ExpiresIn, Freshness, Response, Result, SendOptions, StatusCode, halt, http::header};
 use campfire_storage::file_server::{self, BodyPart};
-use campfire_storage::{Blob, Filename, Json, Staged, Storage, Variation, content_types, disk, paths};
+use campfire_storage::{Blob, Filename, Json, Service, Source, Staged, Storage, Variation, content_types, disk, paths};
 use rusqlite::{OptionalExtension, params};
 use tokio::sync::Semaphore;
 
@@ -259,26 +259,56 @@ fn http_cache_forever(c: &mut Ctx) -> Option<Response> {
     c.fresh_when(Freshness { etag: Some(c.request.fullpath()), last_modified: Some(last_modified), public: true, ..Freshness::default() })
 }
 
-/// `send_blob_stream(blob, disposition:)`: the whole file, inline unless the type is forced to
+/// `send_blob_stream(blob, disposition:)`: the whole object, inline unless the type is forced to
 /// download.
 fn send_blob_stream(c: &mut Ctx, blob: &Blob, disposition: Option<&str>) -> Result {
     let storage = c.app().storage.clone();
-    let path = storage.path_for(blob);
-    if !path.is_file() {
-        // `rescue ActiveStorage::FileNotFoundError`: expires_now, head :not_found.
-        c.expires_now();
-        return Ok(c.head(StatusCode::NOT_FOUND));
-    }
+    let stat = match storage.service.stat(&blob.key) {
+        Ok(stat) => stat,
+        Err(campfire_storage::Error::FileNotFound) => {
+            // `rescue ActiveStorage::FileNotFoundError`: expires_now, head :not_found.
+            c.expires_now();
+            return Ok(c.head(StatusCode::NOT_FOUND));
+        }
+        Err(error) => return Err(Error::internal(error)),
+    };
     let disposition = content_types::forced_disposition(blob.content_type()).or(disposition).unwrap_or("inline");
-    let response = c.send_file(
-        &path,
-        SendOptions {
-            content_type: Some(content_types::for_serving(blob.content_type()).to_string()),
-            disposition: None,
-            ..SendOptions::default()
-        },
-    )?;
+    let content_type = content_types::for_serving(blob.content_type()).to_string();
+    let parts = vec![BodyPart::Range { start: 0, end: stat.size.saturating_sub(1) }];
+    let response = send_object(c, &storage.service, &blob.key, content_type, stat.size, parts);
     Ok(with_disposition(response, disposition, blob))
+}
+
+/// `send_file service.path_for(variant.key), content_type:, disposition: :inline` as the avatar
+/// and logo controllers used to do it. They are the one place outside this module that sends a
+/// blob's bytes directly, and only the disk service has a path to send, so the response is built
+/// the same way as every other object response here. The `Content-Disposition` still carries the
+/// key as its filename, which is what `send_file` derived from the path.
+pub fn send_variant(c: &mut Ctx, variant: &Blob, content_type: &str) -> Result {
+    let storage = c.app().storage.clone();
+    let stat = storage.service.stat(&variant.key).map_err(Error::internal)?;
+    let parts = vec![BodyPart::Range { start: 0, end: stat.size.saturating_sub(1) }];
+    let mut response =
+        c.send_data(bytes::Bytes::new(), SendOptions { filename: Some(variant.key.clone()), ..SendOptions::inline(content_type) });
+    response.body = object_body(&storage.service, &variant.key, parts);
+    if matches!(response.body, campfire_kit::Body::Stream(_)) {
+        response = response.header(header::CONTENT_LENGTH, &stat.size.to_string());
+    }
+    Ok(response)
+}
+
+/// The `send_data`/`send_file` response for `len` bytes of an object, with `parts` as its body.
+/// `send_file` can't be used directly any more: only the disk service has a path, and the body
+/// machinery below is what makes the same response work for an object in a bucket.
+fn send_object(c: &mut Ctx, service: &Service, key: &str, content_type: String, len: u64, parts: Vec<BodyPart>) -> Response {
+    let mut response =
+        c.send_data(bytes::Bytes::new(), SendOptions { content_type: Some(content_type), disposition: None, ..SendOptions::default() });
+    response.body = object_body(service, key, parts);
+    // A streamed body has no length of its own; a file body gets one from the kit.
+    if matches!(response.body, campfire_kit::Body::Stream(_)) {
+        response = response.header(header::CONTENT_LENGTH, &len.to_string());
+    }
+    response
 }
 
 /// `send_data`/`send_stream`'s `Content-Disposition` for the blob's sanitized filename.
@@ -294,13 +324,12 @@ fn send_blob_byte_range_data(c: &mut Ctx, blob: &Blob, range: &str) -> Result {
         Some(ranges) if !ranges.is_empty() => ranges,
         _ => return Ok(c.head(StatusCode::RANGE_NOT_SATISFIABLE)),
     };
-    let path = storage.path_for(blob);
-    if !path.is_file() {
+    if !storage.service.exist(&blob.key) {
         return Err(Error::internal(campfire_storage::Error::FileNotFound));
     }
     let content_type_for_serving = content_types::for_serving(blob.content_type()).to_string();
     let (content_type, parts, content_range) = if let [(start, end)] = ranges[..] {
-        (content_type_for_serving, vec![BodyPart::File { path, start, end }], Some(format!("bytes {start}-{end}/{size}")))
+        (content_type_for_serving, vec![BodyPart::Range { start, end }], Some(format!("bytes {start}-{end}/{size}")))
     } else {
         // `SecureRandom.hex`: 16 random bytes.
         let boundary = hex::encode(rand::random::<[u8; 16]>());
@@ -310,7 +339,7 @@ fn send_blob_byte_range_data(c: &mut Ctx, blob: &Blob, range: &str) -> Result {
                 "\r\n--{boundary}\r\nContent-Type: {content_type_for_serving}\r\nContent-Range: bytes {start}-{end}/{size}\r\n\r\n"
             );
             parts.push(BodyPart::Bytes(heading.into_bytes()));
-            parts.push(BodyPart::File { path: path.clone(), start, end });
+            parts.push(BodyPart::Range { start, end });
         }
         parts.push(BodyPart::Bytes(format!("\r\n--{boundary}--\r\n").into_bytes()));
         (format!("multipart/byteranges; boundary={boundary}"), parts, None)
@@ -322,7 +351,7 @@ fn send_blob_byte_range_data(c: &mut Ctx, blob: &Blob, range: &str) -> Result {
     );
     let mut response = with_disposition(response, disposition, blob);
     let length = parts_len(&parts);
-    response.body = parts_body(parts);
+    response.body = object_body(&storage.service, &blob.key, parts);
     if matches!(response.body, campfire_kit::Body::Stream(_)) {
         response = response.header(header::CONTENT_LENGTH, &length.to_string());
     }
@@ -332,16 +361,20 @@ fn send_blob_byte_range_data(c: &mut Ctx, blob: &Blob, range: &str) -> Result {
     Ok(response.header(header::ACCEPT_RANGES, "bytes"))
 }
 
-/// The body for byte ranges of files and the bytes between them: a single range is sent as a
-/// file body and several are streamed, so neither is read into memory up front.
-fn parts_body(parts: Vec<BodyPart>) -> campfire_kit::Body {
+/// The body for byte ranges of an object and the bytes between them. One whole-file range on the
+/// disk service stays a file body, which the kit streams straight off the filesystem; everything
+/// else is read from the service a part at a time, so nothing is buffered up front — a blob in a
+/// bucket is a ranged `GET`, not a download into memory.
+fn object_body(service: &Service, key: &str, parts: Vec<BodyPart>) -> campfire_kit::Body {
     match <[BodyPart; 1]>::try_from(parts) {
-        Ok([BodyPart::File { path, start, end }]) => {
+        Ok([BodyPart::Range { start, end }]) if service.local_path(key).is_some() => {
+            let path = service.local_path(key).expect("matched above");
             campfire_kit::Body::File(campfire_kit::response::FileBody { path, offset: start, len: end - start + 1 })
         }
         Ok([BodyPart::Bytes(bytes)]) => campfire_kit::Body::Bytes(bytes.into()),
+        Ok([part]) => stream_body(service, key, vec![part]),
         Err(parts) if parts.is_empty() => campfire_kit::Body::Empty,
-        Err(parts) => campfire_kit::Body::Stream(axum::body::Body::from_stream(stream_parts(parts))),
+        Err(parts) => stream_body(service, key, parts),
     }
 }
 
@@ -350,37 +383,57 @@ fn parts_len(parts: &[BodyPart]) -> u64 {
         .iter()
         .map(|part| match part {
             BodyPart::Bytes(bytes) => bytes.len() as u64,
-            BodyPart::File { start, end, .. } => end - start + 1,
+            BodyPart::Range { start, end } => end - start + 1,
         })
         .sum()
 }
 
-/// Reads each part in turn, a chunk at a time.
-fn stream_parts(parts: Vec<BodyPart>) -> impl futures_util::Stream<Item = std::io::Result<bytes::Bytes>> + Send + 'static {
-    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+/// Reads each part in turn, a chunk at a time, on a blocking thread: every service read is
+/// blocking (the bucket client is a blocking HTTP client, see `campfire_storage::s3`), so the
+/// reading cannot happen on a runtime worker. The channel gives back-pressure, and dropping the
+/// response drops the receiver, which ends the task on its next send.
+fn stream_body(service: &Service, key: &str, parts: Vec<BodyPart>) -> campfire_kit::Body {
+    use std::io::Read;
+    let (service, key) = (service.clone(), key.to_string());
     const CHUNK: usize = 64 * 1024;
-    let state = (parts.into_iter(), None::<tokio::io::Take<tokio::fs::File>>);
-    futures_util::stream::try_unfold(state, |(mut parts, mut reading)| async move {
-        loop {
-            if let Some(reader) = reading.as_mut() {
-                let mut chunk = vec![0; CHUNK];
-                let read = reader.read(&mut chunk).await?;
-                if read > 0 {
-                    chunk.truncate(read);
-                    return Ok(Some((bytes::Bytes::from(chunk), (parts, reading))));
+    let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<bytes::Bytes>>(2);
+    tokio::task::spawn_blocking(move || {
+        for part in parts {
+            let mut reader: Box<dyn Read + Send> = match part {
+                BodyPart::Bytes(bytes) => {
+                    if tx.blocking_send(Ok(bytes::Bytes::from(bytes))).is_err() {
+                        return;
+                    }
+                    continue;
                 }
-            }
-            match parts.next() {
-                None => return Ok(None),
-                Some(BodyPart::Bytes(bytes)) => return Ok(Some((bytes::Bytes::from(bytes), (parts, None)))),
-                Some(BodyPart::File { path, start, end }) => {
-                    let mut file = tokio::fs::File::open(&path).await?;
-                    file.seek(std::io::SeekFrom::Start(start)).await?;
-                    reading = Some(file.take(end - start + 1));
+                BodyPart::Range { start, end } => match service.open_range(&key, start, end - start + 1) {
+                    Ok(reader) => reader,
+                    Err(error) => {
+                        let _ = tx.blocking_send(Err(std::io::Error::other(error)));
+                        return;
+                    }
+                },
+            };
+            loop {
+                let mut chunk = vec![0u8; CHUNK];
+                match reader.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(read) => {
+                        chunk.truncate(read);
+                        if tx.blocking_send(Ok(bytes::Bytes::from(chunk))).is_err() {
+                            return;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = tx.blocking_send(Err(error));
+                        return;
+                    }
                 }
             }
         }
-    })
+    });
+    let stream = futures_util::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|item| (item, rx)) });
+    campfire_kit::Body::Stream(axum::body::Body::from_stream(stream))
 }
 
 // --- Disk service ----------------------------------------------------------------------------------
@@ -402,20 +455,18 @@ fn disk_serve(c: &mut Ctx) -> Result {
         range: c.request.header("range"),
         if_modified_since: c.request.header("if-modified-since"),
     };
-    let served =
-        match file_server::serve_file(&request, &storage.service.path_for(&key.key), key.content_type.as_deref(), Some(&key.disposition)) {
-            Ok(served) => served,
-            Err(campfire_storage::Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(c.head(StatusCode::NOT_FOUND));
-            }
-            Err(error) => return Err(Error::internal(error)),
-        };
+    let stat = match storage.service.stat(&key.key) {
+        Ok(stat) => stat,
+        Err(campfire_storage::Error::FileNotFound) => return Ok(c.head(StatusCode::NOT_FOUND)),
+        Err(error) => return Err(Error::internal(error)),
+    };
+    let served = file_server::serve_file(&request, &stat, key.content_type.as_deref(), Some(&key.disposition));
     let mut response = Response::new(StatusCode::from_u16(served.status).map_err(Error::internal)?);
     for (name, value) in &served.headers {
         response = response.header(name.as_str(), value);
     }
     // `served.headers` carries the Content-Length of every part together.
-    response.body = parts_body(served.body);
+    response.body = object_body(&storage.service, &key.key, served.body);
     Ok(response)
 }
 
@@ -433,8 +484,9 @@ pub async fn disk_update(c: &mut Ctx) -> Result {
     }
     let body = c.request.raw_post().clone();
     let (key, checksum) = (token.key.clone(), token.checksum.clone());
-    let uploaded =
-        tokio::task::spawn_blocking(move || storage.service.upload(&key, body.as_ref(), Some(&checksum))).await.map_err(Error::internal)?;
+    let uploaded = tokio::task::spawn_blocking(move || storage.service.upload(&key, Source::Bytes(body.as_ref()), Some(&checksum)))
+        .await
+        .map_err(Error::internal)?;
     match uploaded {
         Ok(()) => Ok(c.head(StatusCode::NO_CONTENT)),
         Err(campfire_storage::Error::Integrity) => Ok(c.head(StatusCode::UNPROCESSABLE_ENTITY)),
@@ -639,25 +691,53 @@ mod tests {
         assert!(matches!(storage_error(campfire_storage::Error::FileNotFound), campfire_db::Error::Other(_)));
     }
 
+    /// The disk service and a bucket are read by the same code path; what differs is only that
+    /// one has a local file and the other does not, so both are driven here over a disk service
+    /// (whose `local_path` can be suppressed by asking for several parts).
     #[tokio::test]
     async fn byte_ranges_are_not_read_into_memory() {
-        let file = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(file.path(), (0..=255u8).cycle().take(200_000).collect::<Vec<u8>>()).unwrap();
-        let path = file.path().to_path_buf();
-        let range = |start, end| BodyPart::File { path: path.clone(), start, end };
+        let root = tempfile::tempdir().unwrap();
+        let contents: Vec<u8> = (0..=255u8).cycle().take(200_000).collect();
+        let service = Service::disk(root.path(), "local");
+        let key = "abcdefghijklmnopqrstuvwxyz12";
+        service.upload(key, Source::Bytes(&contents), None).unwrap();
+        let range = |start, end| BodyPart::Range { start, end };
 
-        match parts_body(vec![range(10, 199_999)]) {
+        match object_body(&service, key, vec![range(10, 199_999)]) {
             campfire_kit::Body::File(body) => assert_eq!((body.offset, body.len), (10, 199_990)),
-            other => panic!("a single range should be a file body, got {other:?}"),
+            other => panic!("a single range on disk should be a file body, got {other:?}"),
         }
 
         let parts = vec![BodyPart::Bytes(b"<".to_vec()), range(0, 2), BodyPart::Bytes(b">".to_vec()), range(100_000, 170_000)];
         let length = parts_len(&parts);
-        let campfire_kit::Body::Stream(stream) = parts_body(parts) else { panic!("several ranges should stream") };
+        let campfire_kit::Body::Stream(stream) = object_body(&service, key, parts) else { panic!("several ranges should stream") };
         let streamed = axum::body::to_bytes(stream, usize::MAX).await.unwrap();
-        let contents = std::fs::read(file.path()).unwrap();
         assert_eq!(streamed, [b"<".as_slice(), &contents[0..3], b">", &contents[100_000..=170_000]].concat());
         assert_eq!(streamed.len() as u64, length);
+    }
+
+    /// A service with no local file (a bucket) streams even a single whole range, and the bytes
+    /// are the object's. `Service::S3` can't be reached from a unit test, so the streaming half
+    /// of `object_body` is driven directly.
+    #[tokio::test]
+    async fn a_service_without_a_local_file_streams_the_object() {
+        let root = tempfile::tempdir().unwrap();
+        let service = Service::disk(root.path(), "local");
+        let key = "abcdefghijklmnopqrstuvwxyz12";
+        service.upload(key, Source::Bytes(b"0123456789"), None).unwrap();
+        let body = stream_body(&service, key, vec![BodyPart::Range { start: 2, end: 5 }]);
+        let campfire_kit::Body::Stream(stream) = body else { panic!("a streamed body") };
+        assert_eq!(axum::body::to_bytes(stream, usize::MAX).await.unwrap(), b"2345".as_slice());
+    }
+
+    /// A read that fails mid-body ends the stream with an error rather than silently truncating.
+    #[tokio::test]
+    async fn a_missing_object_ends_the_stream_with_an_error() {
+        let root = tempfile::tempdir().unwrap();
+        let service = Service::disk(root.path(), "local");
+        let body = stream_body(&service, "absentkeyabsentkeyabsentkey1", vec![BodyPart::Range { start: 0, end: 9 }]);
+        let campfire_kit::Body::Stream(stream) = body else { panic!("a streamed body") };
+        assert!(axum::body::to_bytes(stream, usize::MAX).await.is_err());
     }
 
     #[test]
