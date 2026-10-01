@@ -24,7 +24,7 @@ faster or better.
 | `crates/routes` | `campfire_routes` | Path helpers mirroring `config/routes.rb` |
 | `crates/db` | `campfire_db` | rusqlite over the existing schema, models, queries, fixtures loader |
 | `crates/richtext` | `campfire_richtext` | Action Text content pipeline: sanitize, attachments, autolink, plain text |
-| `crates/storage` | `campfire_storage` | Active Storage-compatible blobs, disk service, variants (libvips), previews (ffmpeg) |
+| `crates/storage` | `campfire_storage` | Active Storage-compatible blobs, the `Service` the bytes live in (disk or an S3 bucket), variants (libvips), previews (ffmpeg) |
 | `crates/cable` | `campfire_cable` | Action Cable protocol server, its WebSocket implementation, and in-process pub/sub |
 | `crates/assets` | `campfire_assets` | Propshaft-compatible digesting, importmap, vendored JS/CSS, port-owned overrides |
 | `crates/views` | `campfire_views` | Askama templates (at the ERB file's relative path) and view helpers |

@@ -27,7 +27,7 @@ protocol recordings all come from running the real Rails app.
 | `kit` | Rack, Action Dispatch and Thruster, on Axum: Rails-style nested params, sessions, flash, format negotiation, forgery protection by `Sec-Fetch-Site`, ETags and gzip built from a page's cached parts, plus an in-process front server with TLS and ACME, HTTP/2 and Thruster's response cache |
 | `db` | Active Record over the existing schema (rusqlite), with the same callbacks, timestamps and STI values, and a Rails-compatible fixture loader |
 | `richtext` | The Action Text pipeline: sanitizing, mentions, opengraph embeds and autolinking, byte-identical to Rails on a 658-case corpus apart from the deliberate differences below |
-| `storage` | Active Storage: the same blob keys, disk layout, variants (libvips) and video previews (ffmpeg), with byte-identical thumbnails |
+| `storage` | Active Storage: the same blob keys and disk layout, variants (libvips) and video previews (ffmpeg) with byte-identical thumbnails, and its service layer — local disk or an S3-compatible bucket |
 | `cable` | The Action Cable protocol server and pub/sub, frame-for-frame with Rails, on a WebSocket implementation of its own that shares and compresses broadcasts |
 | `assets` | Propshaft and importmap-rails, with identical fingerprinted filenames and tags |
 | `views` | The ERB templates as Askama templates at the same paths, DOM-identical apart from the deliberate differences below |
@@ -370,6 +370,20 @@ Deliberate:
   schema if it's missing (a one-time 49 ms for 236k messages). Rails' schema pages a room's messages
   through `index_messages_on_room_id` alone, which sorts the room's whole history for every page.
   The index is additive, so the database still works with the Rails image.
+- **Blobs can live in an S3-compatible bucket.** `crates/storage` had one disk service where Active
+  Storage has a service layer; it now has a `Service` over the local disk and an S3 one, picked by
+  `CAMPFIRE_STORAGE_SERVICE` or, when that is unset, by whether `AWS_BUCKET` and the rest of the
+  `AWS_*` group are in the environment. Credentials are read from there and nowhere else. Objects
+  are named `<prefix><blob key>` (`CAMPFIRE_STORAGE_S3_PREFIX`, default `blobs/`), so the keys in
+  `active_storage_blobs` mean the same thing in either service. Unlike Active Storage's `:amazon`
+  service, blobs are **not** served from presigned bucket URLs: both services keep the app's own
+  signed `/rails/active_storage/disk/...` route and the app streams the bytes, so the access model,
+  the signature and its expiry are unchanged and no browser ever touches the bucket. Direct uploads
+  still `PUT` to the app behind `require_active_storage_authentication`. Uploads to a bucket are
+  checksum-verified against the *source* before anything is written, rather than written and then
+  undone, both because that is stricter and because Cloudflare R2 rejects a `PUT` carrying a
+  `Content-MD5` alongside an `x-amz-checksum-*`. `campfire storage:list [prefix]` prints what the
+  configured service holds.
 - **Leaner libvips and ffmpeg.** The image builds both from the same Debian sources as the Rails
   image, leaving out what Campfire can't reach (see [Running it](#running-it)). Thumbnails, video
   posters and metadata come out byte for byte the same for every image and video format either
