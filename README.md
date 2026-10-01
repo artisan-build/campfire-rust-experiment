@@ -1,4 +1,256 @@
+# Campfire in Rust, deployable on Laravel Cloud
+
+**An independent, experimental fork of [`basecamp/once-campfire-rust`](https://github.com/basecamp/once-campfire-rust).**
+It is not affiliated with, supported by, or endorsed by 37signals, and nothing here comes from them.
+"Campfire" and "ONCE" are 37signals' product names; the MIT licence covers the code, not the names.
+Treat this fork as an experiment, not a product: if you want the real thing, buy
+[ONCE Campfire](https://once.com/campfire).
+
+What this fork adds to upstream is one thing — **it runs on [Laravel Cloud](https://cloud.laravel.com)**,
+built from source by Cloud's own Rust runtime, with the SQLite database and every uploaded file kept
+in an object storage bucket so a deploy doesn't lose them. Two branches, two ways of getting there:
+
+| Branch | How it gets onto Cloud | You need |
+|---|---|---|
+| **`main`** (this one) | Cloud compiles the repository with `cargo build --release` on its **Rust runtime** | early access to the Rust runtime |
+| [`using-go-runtime`](#without-the-rust-runtime-the-using-go-runtime-branch) | a `go.mod` makes Cloud pick its Go runtime, which builds a small launcher around a **prebuilt** binary you publish yourself | nothing special, plus a machine that can build the binary |
+
+The port itself is upstream's work, and so is everything in this README from
+[`# Campfire in Rust`](#campfire-in-rust) down: what was ported, how parity was proven, the
+benchmarks, and running it outside Cloud.
+
+## Deploying to Laravel Cloud
+
+This is the whole procedure, from an empty Cloud account to a working chat server. It takes about
+fifteen minutes, most of it waiting for one build. Every step is the `cloud` CLI or the REST API;
+only attaching the bucket needs either the dashboard or a raw API call.
+
+### What you need
+
+- **A Laravel Cloud account with early access to the Rust runtime.** Say that plainly: at the time
+  of writing the Rust runtime is **not generally available, not documented, and not selectable**.
+  There is no runtime option on `cloud application:create` and no runtime field on an environment.
+  Cloud *detects* it, from a repository whose root looks like a Cargo workspace — which this branch
+  is. If your organization doesn't have it, your environment comes up as PHP or Node and nothing
+  here will build; use [`using-go-runtime`](#without-the-rust-runtime-the-using-go-runtime-branch)
+  instead. Ask Laravel for access; there is no self-serve way on.
+- **The `cloud` CLI**, authenticated: `composer global require laravel/cloud-cli` then `cloud auth`.
+- **A GitHub, GitLab or Bitbucket account** connected to Cloud, holding your fork.
+- About **$7/month**. That is one `flex-512mb` app instance; the bucket costs effectively nothing at
+  chat-sized volumes. No database, no cache, no queue and no WebSocket cluster are needed — the app
+  is one process with SQLite inside it.
+
+### 1. Fork this repository
+
+```sh
+gh repo fork artisan-build/campfire-rust-experiment --clone
+```
+
+Fork rather than point Cloud at this repository directly, so that nobody else's push changes what
+your server runs.
+
+Two things about the fork are worth knowing before you deploy:
+
+- **The `reference/` submodule is required to build.** `crates/assets` digests and embeds the
+  upstream Rails app's CSS and JavaScript at compile time. `.cloud/build` checks the submodule out
+  itself, so you don't have to do anything — but a fork with submodules stripped will not compile.
+- **`.cloud/build` downloads three native dependencies from pinned URLs, each verified by sha256**:
+  a libvips 8.16.1 build for Cloud's exact platform (a release asset on *this* repository, because
+  GitHub does not copy release assets into forks), a static ffmpeg from
+  [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds), and
+  [Litestream](https://litestream.io). Cloud's build image has none of them and cannot install
+  anything (`apt-get` isn't root there). If you would rather not depend on a release of ours, build
+  your own libvips bundle with `.cloud/publish-runtime-bundle` and change the tag and checksum at
+  the top of `.cloud/build`.
+
+### 2. Create the application
+
+```sh
+cloud application:create \
+  --name=campfire \
+  --repository=<you>/campfire-rust-experiment \
+  --source-provider=github \
+  --region=us-east-2
+```
+
+Note the application id and the environment id it prints; everything else needs them. `cloud env:list <app>`
+prints them again later.
+
+Check that Cloud detected Rust, because nothing else will tell you:
+
+```sh
+cloud env:get <env> --json --fields=buildCommand
+```
+
+`cargo build --release` means **Rust**. Anything mentioning `composer`, `npm` or `go build` means
+your organization does not have the Rust runtime and you should stop here.
+
+### 3. Point the build at `.cloud/build`
+
+```sh
+cloud env:update <env> --build-command='sh .cloud/build' --force
+```
+
+The default `cargo build --release` would build every workspace member and install none of the
+native dependencies. `.cloud/build` (88 lines, committed, so changing it is a commit rather than a
+dashboard edit) fetches and checksums libvips, ffmpeg and Litestream into `runtime/`, checks out
+`reference/`, builds `-p campfire` with the linker flags libvips needs, and installs a launcher
+called `boot` into `/var/www/bin`.
+
+Why a launcher: the Rust runtime's start command is fixed and undocumented — it runs the
+first executable it finds in `/var/www/bin`, alphabetically — and the app needs the bundled libvips
+on the loader's path, the bundled ffmpeg on `PATH`, and Litestream wrapped around it.
+`.cloud/boot` does that, and `boot` sorts before `campfire`.
+
+### 4. Set the environment variables
+
+```sh
+cloud env:variables <env> --action=append --key=SECRET_KEY_BASE          --value="$(openssl rand -hex 64)"
+cloud env:variables <env> --action=append --key=RECOVER_UPGRADE_HEADERS  --value=1
+cloud env:variables <env> --action=append --key=CAMPFIRE_STORAGE_PATH    --value=/tmp/campfire-storage
+cloud env:variables <env> --action=append --key=RAILS_ENV                --value=production
+```
+
+| Variable | Why |
+|---|---|
+| `SECRET_KEY_BASE` | Signs sessions and Active Storage URLs. **Required**; the app refuses to boot without it. Generate it once and keep it — changing it signs everyone out and invalidates every blob URL in flight. |
+| `RECOVER_UPGRADE_HEADERS=1` | **Without this there is no realtime.** Cloud's per-instance nginx blanks `Connection` and never forwards `Upgrade`, and every HTTP server decides at parse time whether a connection may become a WebSocket from exactly those two headers — so Action Cable is refused before any application code runs. Set, the app reconstructs both headers in front of its own parser. It is a workaround for the proxy, not a feature; see [Known limits](#known-limits). |
+| `CAMPFIRE_STORAGE_PATH` | Where the SQLite database lives. Cloud's filesystem is wiped by every deploy, so this only has to be writable: `/tmp/campfire-storage` is. Durability comes from Litestream replicating it to the bucket, not from this path. |
+| `RAILS_ENV` | Names the database file (`db/<env>.sqlite3`), as it does under Rails. `.cloud/boot` defaults it to `production`; set it explicitly so a dashboard reader can see it. |
+
+Leave **`DISABLE_SSL` unset.** Cloud terminates TLS at its proxy and forwards
+`X-Forwarded-Proto`, so the app's `assume_ssl` is what makes forgery protection and generated URLs
+see https. Setting `DISABLE_SSL` turns that off and breaks sign-in.
+
+Leave **`TLS_DOMAIN` unset** too — the app would try to get its own Let's Encrypt certificate for a
+port Cloud's proxy owns. `.cloud/boot` serves plain HTTP on `$PORT` behind the proxy.
+
+Optional: `VAPID_PUBLIC_KEY` and `VAPID_PRIVATE_KEY` (a P-256 pair in URL-safe Base64) turn on Web
+Push; without them push is off and the log says so. `RAILS_LOG_LEVEL` and `APP_VERSION` behave as
+they do in the upstream image. Everything else is in `crates/campfire/src/config.rs`.
+
+### 5. Create a bucket and attach it
+
+The bucket is not optional. It holds **both** the SQLite replica (under `campfire/`) and every
+uploaded file (under `blobs/`). Without it, every deploy starts from an empty database and loses
+every attachment.
+
+```sh
+cloud bucket:create \
+  --name=campfire-storage \
+  --region=us-east-2 \
+  --visibility=private \
+  --key-name=campfire \
+  --key-permission=read_write \
+  --allowed-origins=https://<your-environment>.laravel.cloud
+```
+
+`--allowed-origins` is required for a private bucket even though no browser ever talks to it.
+
+Then **attach** it to the environment. The CLI cannot do this; use the dashboard (the
+environment's *Storage* section) or the API:
+
+```sh
+curl -X PATCH https://cloud.laravel.com/api/environments/<env> \
+  -H "Authorization: Bearer $CLOUD_API_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"filesystem_keys":[{"id":"<bucket key id>","disk":"s3","is_default_disk":true}]}'
+```
+
+Attaching is what makes Cloud inject `AWS_BUCKET`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
+`AWS_ENDPOINT_URL` and `AWS_REGION`. **Set none of those by hand.** The app switches its storage
+service from local disk to the bucket purely on `AWS_BUCKET` being present, and Litestream reads the
+same variables, so attaching the bucket is the entire configuration. At boot the log says which it
+picked:
+
+```
+storage: s3 service `local` in bucket fls-… (fls-….r2.cloudflarestorage.com, auto) under "blobs/"
+```
+
+If it says `disk service` instead, the bucket is not attached and nothing you upload will survive.
+
+### 6. Deploy
+
+```sh
+cloud deploy <app> <env>
+```
+
+Expect **about four and a half minutes**: roughly 3m 45s of it is `cargo build --release` with fat
+LTO, from scratch, because Cloud caches nothing for Rust. The 15-minute build cap is not close.
+
+If it fails, read the build log before changing anything — it is complete, and it includes the
+wrapper Cloud puts around your build command:
+
+```sh
+cloud deployment:list <env>
+curl -s https://cloud.laravel.com/api/deployments/<deployment>/logs -H "Authorization: Bearer $CLOUD_API_TOKEN"
+```
+
+### 7. Finish setup in the browser
+
+`https://<your-environment>.laravel.cloud/up` should answer **200**. Then open the site: it
+redirects to the first-run wizard, where the name, email address and password you enter become the
+administrator account. From there, `/account/edit` has the join link that invites everyone else.
+
+That's it. Post a message, drag in a picture, and check that a second browser sees it without
+reloading.
+
+### Known limits
+
+Honest ones, all measured on this deployment rather than assumed:
+
+- **One instance, no horizontal scale.** The database is SQLite inside the process and Action
+  Cable's pub/sub is in-process, so a second replica would be a second, divergent server. Keep
+  `min_replicas` and `max_replicas` at 1. The upstream benchmarks are the ceiling, and it is a high
+  one: 10,000 connected clients in a fifth of Rails' memory.
+- **The WebSocket header workaround is required** (`RECOVER_UPGRADE_HEADERS=1`, above). While you
+  are there: Cloud's nginx uses `proxy_read_timeout 20`, so a WebSocket survives only because
+  Action Cable pings every 3 seconds. Verified by holding a connection idle for 90 seconds.
+- **Hibernation does not appear to fire.** The environment reports `uses_hibernation: true` with a
+  5-minute timeout, and the same process answered after 8 and then 25 minutes of silence. So budget
+  for the instance running continuously, and don't rely on scale-to-zero.
+- **Deploys take ~4.5 minutes** because Cloud keeps no cargo registry or target-directory cache
+  between Rust builds. An unchanged commit recompiles from scratch.
+- **Thumbnails and video posters are not byte-identical to the upstream image's.** This branch's
+  libvips is built against Debian bookworm's codecs and without its Highway SIMD backend (bookworm's
+  libhwy is too old), and ffmpeg is a static BtbN build rather than the Debian trixie 7.1.5 the
+  upstream `Dockerfile` compiles. Everything works and every format still loads; the bytes differ,
+  so the repository's storage vectors do not hold against this build. Resize speed is also lower
+  without Highway.
+- **A 434 MB deploy artifact**, of which 232 MB is the vendored `runtime/` directory and 65 MB the
+  `reference/` submodule. Nothing in Cloud minds, but it is not small.
+- **Attachments are streamed through the app, not served from the bucket.** That is deliberate (it
+  keeps Active Storage's signed-URL access model exactly as Rails has it, and no browser ever holds
+  a bucket credential), but it means every attachment download is an HTTPS round trip from the app
+  to the bucket. Its cost under load is unmeasured.
+- **No backups beyond the replica.** Litestream gives you point-in-time recovery of the database
+  from the bucket; set up whatever you would normally set up on top of that.
+
+### Without the Rust runtime: the `using-go-runtime` branch
+
+If your organization has no Rust early access, the [`using-go-runtime`](../../tree/using-go-runtime)
+branch deploys on a runtime everyone has. It is the same application; only how it gets onto Cloud
+differs.
+
+How that route works: a seven-line `go.mod` in the repository root makes Cloud detect **Go**, and
+`main.go` is not the application but a ~250-line launcher. The build command downloads a **prebuilt
+bundle** — the `campfire` binary plus libvips, ffmpeg and their shared libraries and a complete
+glibc with its own dynamic loader — from a GitHub release, and `go build` compiles only the
+launcher, which then execs the binary through that loader. Deploys take **30–60 seconds** instead of
+four and a half minutes, because nothing of substance is compiled on Cloud.
+
+The catch is in the word *prebuilt*: **you have to build and publish that bundle yourself**, from a
+machine with Docker, with `.cloud/publish-bundle`, and write the release tag into
+`.cloud/bundle-release`. So a deploy ships whatever binary someone last published, and the commit and
+the artifact are only conventionally related — where on `main`, the deploy is reproducible from the
+commit alone. Follow that branch's own notes; the steps for variables, the bucket and the first-run
+wizard are the same as above.
+
+---
+
 # Campfire in Rust
+
+*From here down is the upstream project's README.*
 
 A port of [ONCE Campfire](https://github.com/basecamp/once-campfire) from Rails to Rust. It was
 built to be impossible to tell apart from the Rails app: the same screens pixel for pixel, the same
@@ -502,6 +754,12 @@ Deliberate:
   it an empty plain text as above, and its page shows it as unrenderable.
 - **Not ported:** the duplicate `session_token` cookie Rails' Active Storage streaming sends; and
   legacy AES-CBC encrypted cookies, since Campfire started on GCM.
+- **This fork's Cloud build has two media divergences of its own**, which the Docker image above
+  does not: its libvips is compiled against Debian bookworm's codecs and without the Highway SIMD
+  backend, and its ffmpeg is a static BtbN build rather than Debian trixie's 7.1.5. So thumbnails
+  and video posters from a Laravel Cloud deployment are **not** byte-identical to Rails', and the
+  storage vectors don't hold against it. The `Dockerfile` is unaffected and still builds both from
+  the Rails image's own sources. See [Known limits](#known-limits).
 
 Not fully covered:
 
