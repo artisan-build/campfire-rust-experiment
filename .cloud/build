@@ -3,12 +3,11 @@
 #
 #   sh .cloud/build
 #
-# Unlike `main` — which ships a prebuilt bundle because Cloud's Go runtime has no Rust (see that
-# branch's main.go) — this compiles the binary from source on Cloud. The build image is Debian 12
-# (bookworm, glibc 2.36) on arm64 with the repo's own rustc 1.98.1, 16 cores and no cargo cache
-# between builds, and nothing can be installed into it (apt-get is not root). So the three native
-# dependencies come as pinned, checksummed downloads, installed UNDER the app root because anything
-# outside the deploy artifact is discarded:
+# Cloud compiles the binary from source: no prebuilt bundle, no laptop in the loop. The build image
+# is Debian 12 (bookworm, glibc 2.36) on arm64 with the repo's own rustc 1.98.1, 16 cores and no
+# cargo cache between builds, and nothing can be installed into it (apt-get is not root). So the
+# three native dependencies come as pinned, checksummed downloads, installed UNDER the app root
+# because anything outside the deploy artifact is discarded:
 #
 #   runtime/lib  libvips and its closure, built for this exact platform (.cloud/publish-runtime-bundle)
 #   runtime/bin  ffmpeg and ffprobe (a BtbN static LGPL build), and litestream

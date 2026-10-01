@@ -39,7 +39,7 @@ const SIGNED_FOR: Duration = Duration::from_secs(120);
 
 /// The prefix blob objects live under, so that nothing else sharing the bucket can collide with
 /// them. Laravel Cloud attaches one bucket per environment and the port already keeps the SQLite
-/// database's Litestream replica in it under `campfire/` (see `main.go`).
+/// database's Litestream replica in it under `campfire/` (see `.cloud/boot`).
 pub const DEFAULT_PREFIX: &str = "blobs/";
 
 #[derive(Clone)]
@@ -341,7 +341,7 @@ mod tests {
     #[test]
     fn an_object_is_the_blob_key_under_the_blob_prefix() {
         assert_eq!(service().object("abcdefghijklmnopqrstuvwxyz12"), "blobs/abcdefghijklmnopqrstuvwxyz12");
-        // Litestream's replica (`campfire/...`, see main.go) can never collide with a blob.
+        // Litestream's replica (`campfire/...`, see .cloud/boot) can never collide with a blob.
         assert!(service().object("anything").starts_with("blobs/"));
     }
 
