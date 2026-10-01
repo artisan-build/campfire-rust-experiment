@@ -1,0 +1,81 @@
+#!/bin/sh
+# What Laravel Cloud's Rust runtime runs as the build command for this branch:
+#
+#   sh .cloud/build
+#
+# Unlike `main` — which ships a prebuilt bundle because Cloud's Go runtime has no Rust (see that
+# branch's main.go) — this compiles the binary from source on Cloud. The build image is Debian 12
+# (bookworm, glibc 2.36) on arm64 with the repo's own rustc 1.98.1, 16 cores and no cargo cache
+# between builds, and nothing can be installed into it (apt-get is not root). So the three native
+# dependencies come as pinned, checksummed downloads, installed UNDER the app root because anything
+# outside the deploy artifact is discarded:
+#
+#   runtime/lib  libvips and its closure, built for this exact platform (.cloud/publish-runtime-bundle)
+#   runtime/bin  ffmpeg and ffprobe (a BtbN static LGPL build), and litestream
+#
+# The start command Cloud's Rust runtime uses is fixed and undocumented:
+#
+#   $(find /var/www/bin -maxdepth 1 -type f -executable | sort | head -1)
+#
+# so the launcher goes to /var/www/bin (a sibling of the app path, and part of the artifact) under a
+# name that sorts before anything cargo's output might put there.
+set -eu
+
+VIPS_TAG=vips-bookworm-arm64-8.16.1
+VIPS_SHA256=77c6f237cdda66407622bbeefc554626d63c54285bc5d8bea38e2900b1b7f9e0
+
+# A static LGPL build, so no ffmpeg shared libraries have to be shipped or found at run time. The
+# archive expands to ~290 MB of which only these two files are kept. Pinned the way slate pins it.
+FFMPEG_RELEASE=autobuild-2026-08-31-13-27
+FFMPEG_ASSET=ffmpeg-n9.0.1-11-ge47273f4d9-linuxarm64-lgpl-9.0.tar.xz
+
+LITESTREAM_VERSION=0.5.17
+LITESTREAM_SHA256=f8ca4a050095c1efbda2c4365172e61bf9d955ea0d9ac42f448b52e51819baa5
+
+step() { printf '\n==> %s\n' "$1"; }
+verify() { printf '%s  %s\n' "$2" "$1" | sha256sum -c -; }
+
+step "libvips $VIPS_TAG"
+curl -fsSL "https://github.com/artisan-build/campfire-rust-experiment/releases/download/${VIPS_TAG}/campfire-vips-bookworm-arm64.tar.gz" -o /tmp/vips.tar.gz
+verify /tmp/vips.tar.gz "$VIPS_SHA256"
+mkdir -p runtime
+tar -xzf /tmp/vips.tar.gz -C runtime
+rm -f /tmp/vips.tar.gz
+
+step "ffmpeg $FFMPEG_ASSET"
+curl -fsSL "https://github.com/BtbN/FFmpeg-Builds/releases/download/${FFMPEG_RELEASE}/${FFMPEG_ASSET}" -o /tmp/ffmpeg.tar.xz
+curl -fsSL "https://github.com/BtbN/FFmpeg-Builds/releases/download/${FFMPEG_RELEASE}/checksums.sha256" -o /tmp/ffmpeg.sha256
+verify /tmp/ffmpeg.tar.xz "$(awk -v a="$FFMPEG_ASSET" '$2 == a { print $1 }' /tmp/ffmpeg.sha256)"
+mkdir -p runtime/bin
+tar -xJf /tmp/ffmpeg.tar.xz -C /tmp --strip-components=2 --wildcards '*/bin/ffmpeg' '*/bin/ffprobe'
+mv /tmp/ffmpeg /tmp/ffprobe runtime/bin/
+rm -f /tmp/ffmpeg.tar.xz /tmp/ffmpeg.sha256
+
+step "litestream $LITESTREAM_VERSION"
+curl -fsSL "https://github.com/benbjohnson/litestream/releases/download/v${LITESTREAM_VERSION}/litestream-${LITESTREAM_VERSION}-linux-arm64.tar.gz" -o /tmp/litestream.tar.gz
+verify /tmp/litestream.tar.gz "$LITESTREAM_SHA256"
+tar -xzf /tmp/litestream.tar.gz -C runtime/bin litestream
+rm -f /tmp/litestream.tar.gz
+chmod 755 runtime/bin/*
+
+step "reference/ submodule"
+# crates/assets/build.rs digests and embeds the reference app's assets, so the submodule has to be
+# checked out. Cloud clones the repository but not its submodules.
+if [ ! -f reference/Gemfile ]; then
+  git submodule update --init --depth 1 -- reference
+fi
+ls reference | head -5
+
+step "cargo build --release --locked -p campfire"
+# crates/storage links libvips, libgobject-2.0 and libglib-2.0 by name
+# (crates/storage/src/vips.rs), which the linker resolves through the bundle's unversioned symlinks.
+export LIBRARY_PATH="$PWD/runtime/lib"
+# jemalloc bakes the page size in: 16 KB works on both 4 KB and 16 KB arm64 kernels.
+export JEMALLOC_SYS_WITH_LG_PAGE=14
+time cargo build --release --locked -p campfire
+install -D -m 755 "${CARGO_TARGET_DIR:-target}/release/campfire" libexec/campfire
+
+step "launcher"
+install -D -m 755 .cloud/boot /var/www/bin/boot
+ls -la /var/www/bin
+du -sh libexec/campfire runtime

@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# Builds and publishes the libvips bundle the Cloud build command links against (see .cloud/build).
+#
+# Cloud's Rust runtime builds the binary from source on Cloud, but its build image carries no
+# libvips and no glib, and nothing can be installed into it (apt-get is not root). So libvips comes
+# as a pinned, checksummed asset: built here for the runtime's exact platform (Debian 12 bookworm,
+# glibc 2.36, arm64), with its shared-library closure minus what Cloud's runtime image already has.
+#
+#   .cloud/publish-runtime-bundle          # build, upload, and print the sha256 for .cloud/build
+#
+# Must run on an arm64 Docker host. The excluded libraries are the ones measured in Cloud's runtime
+# container (.cloud/runtime-libs), so a change to Cloud's base image is what would make this stale.
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+# `gh repo view` with no argument resolves the `upstream` remote, which is 37signals'.
+repo=$(gh repo view "$(git remote get-url origin)" --json nameWithOwner --jq .nameWithOwner)
+version=8.16.1
+tag="vips-bookworm-arm64-${version}"
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+
+docker build --platform linux/arm64 -f .cloud/runtime-bundle.Dockerfile -t "campfire-vips-bookworm:${version}" .
+
+# Collect libvips, the three sonames the FFI links by name (crates/storage/src/vips.rs), and the
+# closure, skipping anything Cloud's runtime image already provides.
+docker run --rm --platform linux/arm64 -v "$work:/out" \
+  -v "$PWD/.cloud/runtime-libs:/runtime-libs:ro" "campfire-vips-bookworm:${version}" bash -euo pipefail -c '
+  mkdir -p /out/lib
+  copy() {
+    base=$(basename "$1")
+    grep -qxF "$base" /runtime-libs && return 0
+    cp -L "$1" "/out/lib/$base"
+  }
+  copy /opt/vips/lib/libvips.so.42
+  ldd /opt/vips/lib/libvips.so.42 | awk "/=> \// {print \$3}" | sort -u | while read -r so; do copy "$so"; done
+  # The linker resolves -lvips/-lgobject-2.0/-lglib-2.0 through the unversioned names.
+  for name in libvips libgobject-2.0 libglib-2.0; do
+    target=$(cd /out/lib && ls "$name".so.* | head -1)
+    ln -sf "$target" "/out/lib/$name.so"
+  done
+  strip --strip-unneeded /out/lib/*.so.* 2>/dev/null || true
+  ls -la /out/lib
+'
+
+asset="$work/campfire-vips-bookworm-arm64.tar.gz"
+tar -czf "$asset" -C "$work" lib
+sha=$(shasum -a 256 "$asset" | cut -d' ' -f1)
+
+if gh release view "$tag" --repo "$repo" >/dev/null 2>&1; then
+  gh release upload "$tag" "$asset" --repo "$repo" --clobber
+else
+  gh release create "$tag" "$asset" --repo "$repo" --title "$tag" \
+    --notes "libvips ${version} and its non-core closure, built for Debian 12 (bookworm) arm64 — the platform of Laravel Cloud's Rust build image and runtime container."
+fi
+printf 'published %s (%s)\nVIPS_SHA256=%s\n' "$tag" "$(du -h "$asset" | cut -f1)" "$sha"

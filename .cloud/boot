@@ -1,0 +1,61 @@
+#!/bin/sh
+# The process Laravel Cloud's Rust runtime starts. Installed to /var/www/bin by .cloud/build,
+# because the runtime's start command is a fixed
+#
+#   $(find /var/www/bin -maxdepth 1 -type f -executable | sort | head -1)
+#
+# and `boot` sorts before anything else that ends up there.
+#
+# What it has to do beyond exec'ing the binary:
+#
+#   * put the bundled libvips on the loader's path, and the bundled ffmpeg/ffprobe on PATH, since
+#     neither is in Cloud's runtime image (crates/storage shells out to both);
+#   * serve on the port the per-instance nginx proxies to (it proxies 127.0.0.1:$PORT);
+#   * keep the SQLite database on the attached bucket with Litestream, because Cloud's filesystem is
+#     wiped by every deploy, reboot and scale-to-zero wake.
+#
+# Everything here is overridable: a value already in the environment always wins, so any of it can
+# be changed from the Cloud dashboard without a new deploy of this script.
+set -eu
+
+app=/var/www/html
+cd "$app"
+
+default() { eval "v=\${$1-}"; [ -n "$v" ] || export "$1=$2"; }
+
+default LD_LIBRARY_PATH "$app/runtime/lib"
+default PATH "$app/runtime/bin:$PATH"
+# Cloud terminates TLS at its proxy, so the binary serves plain HTTP and leaves its own TLS/ACME off
+# (no TLS_DOMAIN). DISABLE_SSL stays unset so that assume_ssl keeps forgery protection seeing https.
+default HTTP_PORT "${PORT:-3000}"
+default RAILS_ENV production
+
+echo "boot: injected variables: $(env | cut -d= -f1 | sort | tr '\n' ' ')" >&2
+
+storage=${CAMPFIRE_STORAGE_PATH:-$app/storage}
+database=${CAMPFIRE_DATABASE_PATH:-$storage/db/${RAILS_ENV}.sqlite3}
+
+if [ -z "${AWS_BUCKET-}" ]; then
+  echo "boot: no AWS_BUCKET; the database lives only on the ephemeral filesystem" >&2
+  exec "$app/libexec/campfire" server
+fi
+
+mkdir -p "$(dirname "$database")"
+# No credentials in the file: Litestream reads AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY from the
+# environment Cloud injected, so nothing secret is written to disk.
+config=${TMPDIR:-/tmp}/litestream.yml
+cat > "$config" <<YAML
+dbs:
+  - path: ${database}
+    replicas:
+      - type: s3
+        bucket: ${AWS_BUCKET}
+        path: campfire
+        endpoint: ${AWS_ENDPOINT_URL-}
+        region: ${AWS_REGION-}
+        force-path-style: true
+YAML
+
+# A failed restore must not silently start an empty database over a live replica.
+litestream restore -config "$config" -if-db-not-exists -if-replica-exists "$database"
+exec litestream replicate -config "$config" -exec "$app/libexec/campfire server"
