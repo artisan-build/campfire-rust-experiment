@@ -149,9 +149,21 @@ func databasePath() string {
 // these stays overridable from the Cloud dashboard.
 func environment(root string, libs []string) []string {
 	env := os.Environ()
+	// Replaces an existing entry rather than appending a second one: a duplicate key in the
+	// environment an exec is given is resolved to the FIRST match, so appending `PATH=...` to an
+	// environment that already has a PATH changes nothing at all.
+	put := func(key, value string) {
+		for i, entry := range env {
+			if strings.HasPrefix(entry, key+"=") {
+				env[i] = key + "=" + value
+				return
+			}
+		}
+		env = append(env, key+"="+value)
+	}
 	set := func(key, value string) {
 		if os.Getenv(key) == "" {
-			env = append(env, key+"="+value)
+			put(key, value)
 		}
 	}
 	// Cloud injects PORT and terminates TLS at its proxy, so the binary serves plain HTTP there and
@@ -160,7 +172,11 @@ func environment(root string, libs []string) []string {
 	if port := os.Getenv("PORT"); port != "" {
 		set("HTTP_PORT", port)
 	}
-	set("PATH", filepath.Join(root, "wrap")+":"+os.Getenv("PATH"))
+	// PATH is always set in the runtime container, so this one cannot use `set`: the bundle's
+	// ffmpeg/ffprobe wrappers have to go in *front* of whatever is already there. Without this
+	// the binary finds no ffmpeg at all, and a video attachment 500s with "no previewer found"
+	// instead of getting a poster.
+	put("PATH", filepath.Join(root, "wrap")+":"+os.Getenv("PATH"))
 	set("SSL_CERT_FILE", filepath.Join(root, "etc/ssl/certs/ca-certificates.crt"))
 	set("SSL_CERT_DIR", filepath.Join(root, "etc/ssl/certs"))
 	set("LD_LIBRARY_PATH", strings.Join(libs, ":"))
