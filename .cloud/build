@@ -17,8 +17,9 @@
 #
 #   $(find /var/www/bin -maxdepth 1 -type f -executable | sort | head -1)
 #
-# so the launcher goes to /var/www/bin (a sibling of the app path, and part of the artifact) under a
-# name that sorts before anything cargo's output might put there.
+# and Cloud's own wrapper around this script already copies every executable file in
+# $CARGO_TARGET_DIR/release and target/release into /var/www/bin. So `campfire` lands there by
+# itself, and the launcher goes in beside it under a name that sorts first.
 set -eu
 
 VIPS_TAG=vips-bookworm-arm64-8.16.1
@@ -67,12 +68,14 @@ fi
 ls reference | head -5
 
 step "cargo build --release --locked -p campfire"
+started=$(date +%s)
 # crates/storage links libvips, libgobject-2.0 and libglib-2.0 by name
 # (crates/storage/src/vips.rs), which the linker resolves through the bundle's unversioned symlinks.
 export LIBRARY_PATH="$PWD/runtime/lib"
 # jemalloc bakes the page size in: 16 KB works on both 4 KB and 16 KB arm64 kernels.
 export JEMALLOC_SYS_WITH_LG_PAGE=14
-time cargo build --release --locked -p campfire
+cargo build --release --locked -p campfire
+printf 'cargo build took %ss\n' "$(( $(date +%s) - started ))"
 install -D -m 755 "${CARGO_TARGET_DIR:-target}/release/campfire" libexec/campfire
 
 step "launcher"
